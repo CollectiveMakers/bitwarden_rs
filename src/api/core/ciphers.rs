@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use chrono::{NaiveDateTime, Utc};
 use rocket::{http::ContentType, request::Form, Data, Route};
 use rocket_contrib::json::Json;
 use serde_json::Value;
@@ -48,7 +49,7 @@ pub fn routes() -> Vec<Route> {
         post_cipher_admin,
         post_cipher_share,
         put_cipher_share,
-        put_cipher_share_seleted,
+        put_cipher_share_selected,
         post_cipher,
         put_cipher,
         delete_cipher_post,
@@ -194,6 +195,14 @@ pub struct CipherData {
     #[serde(rename = "Attachments")]
     _Attachments: Option<Value>, // Unused, contains map of {id: filename}
     Attachments2: Option<HashMap<String, Attachments2Data>>,
+
+    // The revision datetime (in ISO 8601 format) of the client's local copy
+    // of the cipher. This is used to prevent a client from updating a cipher
+    // when it doesn't have the latest version, as that can result in data
+    // loss. It's not an error when no value is provided; this can happen
+    // when using older client versions, or if the operation doesn't involve
+    // updating an existing cipher.
+    LastKnownRevisionDate: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -203,22 +212,35 @@ pub struct Attachments2Data {
     Key: String,
 }
 
+/// Called when an org admin clones an org cipher.
 #[post("/ciphers/admin", data = "<data>")]
 fn post_ciphers_admin(data: JsonUpcase<ShareCipherData>, headers: Headers, conn: DbConn, nt: Notify) -> JsonResult {
-    let data: ShareCipherData = data.into_inner().data;
+    post_ciphers_create(data, headers, conn, nt)
+}
+
+/// Called when creating a new org-owned cipher, or cloning a cipher (whether
+/// user- or org-owned). When cloning a cipher to a user-owned cipher,
+/// `organizationId` is null.
+#[post("/ciphers/create", data = "<data>")]
+fn post_ciphers_create(data: JsonUpcase<ShareCipherData>, headers: Headers, conn: DbConn, nt: Notify) -> JsonResult {
+    let mut data: ShareCipherData = data.into_inner().data;
 
     let mut cipher = Cipher::new(data.Cipher.Type, data.Cipher.Name.clone());
     cipher.user_uuid = Some(headers.user.uuid.clone());
     cipher.save(&conn)?;
 
+    // When cloning a cipher, the Bitwarden clients seem to set this field
+    // based on the cipher being cloned (when creating a new cipher, it's set
+    // to null as expected). However, `cipher.created_at` is initialized to
+    // the current time, so the stale data check will end up failing down the
+    // line. Since this function only creates new ciphers (whether by cloning
+    // or otherwise), we can just ignore this field entirely.
+    data.Cipher.LastKnownRevisionDate = None;
+
     share_cipher_by_uuid(&cipher.uuid, data, &headers, &conn, &nt)
 }
 
-#[post("/ciphers/create", data = "<data>")]
-fn post_ciphers_create(data: JsonUpcase<ShareCipherData>, headers: Headers, conn: DbConn, nt: Notify) -> JsonResult {
-    post_ciphers_admin(data, headers, conn, nt)
-}
-
+/// Called when creating a new user-owned cipher.
 #[post("/ciphers", data = "<data>")]
 fn post_ciphers(data: JsonUpcase<CipherData>, headers: Headers, conn: DbConn, nt: Notify) -> JsonResult {
     let data: CipherData = data.into_inner().data;
@@ -238,6 +260,17 @@ pub fn update_cipher_from_data(
     nt: &Notify,
     ut: UpdateType,
 ) -> EmptyResult {
+    // Check that the client isn't updating an existing cipher with stale data.
+    if let Some(dt) = data.LastKnownRevisionDate {
+        match NaiveDateTime::parse_from_str(&dt, "%+") { // ISO 8601 format
+            Err(err) =>
+                warn!("Error parsing LastKnownRevisionDate '{}': {}", dt, err),
+            Ok(dt) if cipher.updated_at.signed_duration_since(dt).num_seconds() > 1 =>
+                err!("The client copy of this cipher is out of date. Resync the client and try again."),
+            Ok(_) => (),
+        }
+    }
+
     if cipher.organization_uuid.is_some() && cipher.organization_uuid != data.OrganizationId {
         err!("Organization mismatch. Please resync the client before updating the cipher")
     }
@@ -387,6 +420,7 @@ fn post_ciphers_import(data: JsonUpcase<ImportData>, headers: Headers, conn: DbC
     Ok(())
 }
 
+/// Called when an org admin modifies an existing org cipher.
 #[put("/ciphers/<uuid>/admin", data = "<data>")]
 fn put_cipher_admin(
     uuid: String,
@@ -561,7 +595,7 @@ struct ShareSelectedCipherData {
 }
 
 #[put("/ciphers/share", data = "<data>")]
-fn put_cipher_share_seleted(
+fn put_cipher_share_selected(
     data: JsonUpcase<ShareSelectedCipherData>,
     headers: Headers,
     conn: DbConn,
@@ -1030,7 +1064,7 @@ fn _delete_cipher_by_uuid(uuid: &str, headers: &Headers, conn: &DbConn, soft_del
     }
 
     if soft_delete {
-        cipher.deleted_at = Some(chrono::Utc::now().naive_utc());
+        cipher.deleted_at = Some(Utc::now().naive_utc());
         cipher.save(&conn)?;
         nt.send_cipher_update(UpdateType::CipherUpdate, &cipher, &cipher.update_users_revision(&conn));
     } else {

@@ -11,6 +11,7 @@ db_object! {
     #[primary_key(uuid)]
     pub struct User {
         pub uuid: String,
+        pub enabled: bool,
         pub created_at: NaiveDateTime,
         pub updated_at: NaiveDateTime,
         pub verified_at: Option<NaiveDateTime>,
@@ -36,6 +37,7 @@ db_object! {
         pub totp_recover: Option<String>,
 
         pub security_stamp: String,
+        pub stamp_exception: Option<String>,
 
         pub equivalent_domains: String,
         pub excluded_globals: String,
@@ -59,6 +61,12 @@ enum UserStatus {
     _Disabled = 2,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct UserStampException {
+  pub route: String,
+  pub security_stamp: String
+}
+
 /// Local methods
 impl User {
     pub const CLIENT_KDF_TYPE_DEFAULT: i32 = 0; // PBKDF2: 0
@@ -70,6 +78,7 @@ impl User {
 
         Self {
             uuid: crate::util::get_uuid(),
+            enabled: true,
             created_at: now,
             updated_at: now,
             verified_at: None,
@@ -86,6 +95,7 @@ impl User {
             password_iterations: CONFIG.password_iterations(),
 
             security_stamp: crate::util::get_uuid(),
+            stamp_exception: None,
 
             password_hint: None,
             private_key: None,
@@ -119,13 +129,51 @@ impl User {
         }
     }
 
-    pub fn set_password(&mut self, password: &str) {
+    /// Set the password hash generated
+    /// And resets the security_stamp. Based upon the allow_next_route the security_stamp will be different.
+    ///
+    /// # Arguments
+    ///
+    /// * `password` - A str which contains a hashed version of the users master password.
+    /// * `allow_next_route` - A Option<&str> with the function name of the next allowed (rocket) route.
+    ///
+    pub fn set_password(&mut self, password: &str, allow_next_route: Option<&str>) {
         self.password_hash = crypto::hash_password(password.as_bytes(), &self.salt, self.password_iterations as u32);
-        self.reset_security_stamp();
+
+        if let Some(route) = allow_next_route {
+            self.set_stamp_exception(route);
+        }
+
+        self.reset_security_stamp()
     }
 
     pub fn reset_security_stamp(&mut self) {
         self.security_stamp = crate::util::get_uuid();
+    }
+
+    /// Set the stamp_exception to only allow a subsequent request matching a specific route using the current security-stamp.
+    ///
+    /// # Arguments
+    /// * `route_exception` - A str with the function name of the next allowed (rocket) route.
+    ///
+    /// ### Future
+    /// In the future it could be posible that we need more of these exception routes.
+    /// In that case we could use an Vec<UserStampException> and add multiple exceptions.
+    pub fn set_stamp_exception(&mut self, route_exception: &str) {
+        let stamp_exception = UserStampException {
+            route: route_exception.to_string(),
+            security_stamp: self.security_stamp.to_string()
+        };
+        self.stamp_exception = Some(serde_json::to_string(&stamp_exception).unwrap_or_default());
+    }
+
+    /// Resets the stamp_exception to prevent re-use of the previous security-stamp
+    ///
+    /// ### Future
+    /// In the future it could be posible that we need more of these exception routes.
+    /// In that case we could use an Vec<UserStampException> and add multiple exceptions.
+    pub fn reset_stamp_exception(&mut self) {
+        self.stamp_exception = None;
     }
 }
 
@@ -287,6 +335,13 @@ impl User {
         db_run! {conn: {
             users::table.load::<UserDb>(conn).expect("Error loading users").from_db()
         }}
+    }
+
+    pub fn last_active(&self, conn: &DbConn) -> Option<NaiveDateTime> {
+        match Device::find_latest_active_by_user(&self.uuid, conn) {
+            Some(device) => Some(device.updated_at),
+            None => None
+        }
     }
 }
 

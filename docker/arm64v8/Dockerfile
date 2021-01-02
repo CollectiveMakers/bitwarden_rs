@@ -10,15 +10,15 @@
 #  It can be viewed in multiple ways:
 #  - From the https://hub.docker.com/repository/docker/bitwardenrs/web-vault/tags page, click the tag name and the digest should be there.
 #  - From the console, with the following commands:
-#      docker pull bitwardenrs/web-vault:v2.16.1
-#      docker image inspect --format "{{.RepoDigests}}" bitwardenrs/web-vault:v2.16.1
+#      docker pull bitwardenrs/web-vault:v2.17.1
+#      docker image inspect --format "{{.RepoDigests}}" bitwardenrs/web-vault:v2.17.1
 #
 #  - To do the opposite, and get the tag from the hash, you can do:
-#      docker image inspect --format "{{.RepoTags}}" bitwardenrs/web-vault@sha256:e40228f94cead5e50af6575fb39850a002dad146dab6836e5da5663e6d214303
-FROM bitwardenrs/web-vault@sha256:e40228f94cead5e50af6575fb39850a002dad146dab6836e5da5663e6d214303 as vault
+#      docker image inspect --format "{{.RepoTags}}" bitwardenrs/web-vault@sha256:dcb7884dc5845b3842ff2204fe77482000b771495c6c359297ec3c03330d65e0
+FROM bitwardenrs/web-vault@sha256:dcb7884dc5845b3842ff2204fe77482000b771495c6c359297ec3c03330d65e0 as vault
 
 ########################## BUILD IMAGE  ##########################
-FROM rust:1.46 as build
+FROM rust:1.48 as build
 
 # Debian-based builds support multidb
 ARG DB=sqlite,mysql,postgresql
@@ -70,12 +70,10 @@ COPY ./build.rs ./build.rs
 # We at least need libmariadb3:amd64 installed for the x86_64 version of libmariadb.so (client)
 # We also need the libmariadb-dev-compat:amd64 but it can not be installed together with the :arm64 version.
 # What we can do is a force install, because nothing important is overlapping each other.
-RUN apt-get install -y libmariadb3:amd64 && \
-    mkdir -pv /tmp/dpkg && \
-    cd /tmp/dpkg && \
+RUN apt-get install -y --no-install-recommends libmariadb3:amd64 && \
     apt-get download libmariadb-dev-compat:amd64 && \
-    dpkg --force-all -i *.deb && \
-    rm -rf /tmp/dpkg
+    dpkg --force-all -i ./libmariadb-dev-compat*.deb && \
+    rm -rvf ./libmariadb-dev-compat*.deb
 
 # For Diesel-RS migrations_macros to compile with PostgreSQL we need to do some magic.
 # The libpq5:arm64 package seems to not provide a symlink to libpq.so.5 with the name libpq.so.

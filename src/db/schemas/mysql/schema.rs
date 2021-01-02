@@ -116,6 +116,7 @@ table! {
 table! {
     users (uuid) {
         uuid -> Text,
+        enabled -> Bool,
         created_at -> Datetime,
         updated_at -> Datetime,
         verified_at -> Nullable<Datetime>,
@@ -135,6 +136,7 @@ table! {
         totp_secret -> Nullable<Text>,
         totp_recover -> Nullable<Text>,
         security_stamp -> Text,
+        stamp_exception -> Nullable<Text>,
         equivalent_domains -> Text,
         excluded_globals -> Text,
         client_kdf_type -> Integer,
