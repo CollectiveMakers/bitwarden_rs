@@ -169,6 +169,7 @@ table! {
         user_uuid -> Text,
         device_uuid -> Text,
         device_name -> Text,
+        device_type -> Integer,
         login_time -> Timestamp,
         ip_address -> Text,
     }
@@ -225,6 +226,7 @@ table! {
         collection_uuid -> Text,
         read_only -> Bool,
         hide_passwords -> Bool,
+        manage -> Bool,
     }
 }
 
@@ -294,6 +296,7 @@ table! {
         groups_uuid -> Text,
         read_only -> Bool,
         hide_passwords -> Bool,
+        manage -> Bool,
     }
 }
 

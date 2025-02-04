@@ -10,7 +10,7 @@ use crate::{
     api::{core::two_factor::duo::get_duo_keys_email, EmptyResult},
     crypto,
     db::{
-        models::{EventType, TwoFactorDuoContext},
+        models::{DeviceId, EventType, TwoFactorDuoContext},
         DbConn, DbPool,
     },
     error::Error,
@@ -211,10 +211,7 @@ impl DuoClient {
             nonce,
         };
 
-        let token = match self.encode_duo_jwt(jwt_payload) {
-            Ok(token) => token,
-            Err(e) => return Err(e),
-        };
+        let token = self.encode_duo_jwt(jwt_payload)?;
 
         let authz_endpoint = format!("https://{}/oauth/v1/authorize", self.api_host);
         let mut auth_url = match Url::parse(authz_endpoint.as_str()) {
@@ -357,7 +354,7 @@ pub async fn purge_duo_contexts(pool: DbPool) {
 // Construct the url that Duo should redirect users to.
 fn make_callback_url(client_name: &str) -> Result<String, Error> {
     // Get the location of this application as defined in the config.
-    let base = match Url::parse(CONFIG.domain().as_str()) {
+    let base = match Url::parse(&format!("{}/", CONFIG.domain())) {
         Ok(url) => url,
         Err(e) => err!(format!("Error parsing configured domain URL (check your domain configuration): {e:?}")),
     };
@@ -382,7 +379,7 @@ fn make_callback_url(client_name: &str) -> Result<String, Error> {
 pub async fn get_duo_auth_url(
     email: &str,
     client_id: &str,
-    device_identifier: &String,
+    device_identifier: &DeviceId,
     conn: &mut DbConn,
 ) -> Result<String, Error> {
     let (ik, sk, _, host) = get_duo_keys_email(email, conn).await?;
@@ -420,7 +417,7 @@ pub async fn validate_duo_login(
     email: &str,
     two_factor_token: &str,
     client_id: &str,
-    device_identifier: &str,
+    device_identifier: &DeviceId,
     conn: &mut DbConn,
 ) -> EmptyResult {
     // Result supplied to us by clients in the form "<authz code>|<state>"

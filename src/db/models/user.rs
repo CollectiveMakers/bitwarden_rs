@@ -1,8 +1,19 @@
 use chrono::{NaiveDateTime, TimeDelta, Utc};
+use derive_more::{AsRef, Deref, Display, From};
 use serde_json::Value;
 
-use crate::crypto;
-use crate::CONFIG;
+use super::{
+    Cipher, Device, EmergencyAccess, Favorite, Folder, Membership, MembershipType, TwoFactor, TwoFactorIncomplete,
+};
+use crate::{
+    api::EmptyResult,
+    crypto,
+    db::DbConn,
+    error::MapResult,
+    util::{format_date, get_uuid, retry},
+    CONFIG,
+};
+use macros::UuidFromParam;
 
 db_object! {
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -10,7 +21,7 @@ db_object! {
     #[diesel(treat_none_as_null = true)]
     #[diesel(primary_key(uuid))]
     pub struct User {
-        pub uuid: String,
+        pub uuid: UserId,
         pub enabled: bool,
         pub created_at: NaiveDateTime,
         pub updated_at: NaiveDateTime,
@@ -90,7 +101,7 @@ impl User {
         let email = email.to_lowercase();
 
         Self {
-            uuid: crate::util::get_uuid(),
+            uuid: UserId(get_uuid()),
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -107,7 +118,7 @@ impl User {
             salt: crypto::get_random_bytes::<64>().to_vec(),
             password_iterations: CONFIG.password_iterations(),
 
-            security_stamp: crate::util::get_uuid(),
+            security_stamp: get_uuid(),
             stamp_exception: None,
 
             password_hint: None,
@@ -144,14 +155,14 @@ impl User {
 
     pub fn check_valid_recovery_code(&self, recovery_code: &str) -> bool {
         if let Some(ref totp_recover) = self.totp_recover {
-            crate::crypto::ct_eq(recovery_code, totp_recover.to_lowercase())
+            crypto::ct_eq(recovery_code, totp_recover.to_lowercase())
         } else {
             false
         }
     }
 
     pub fn check_valid_api_key(&self, key: &str) -> bool {
-        matches!(self.api_key, Some(ref api_key) if crate::crypto::ct_eq(api_key, key))
+        matches!(self.api_key, Some(ref api_key) if crypto::ct_eq(api_key, key))
     }
 
     /// Set the password hash generated
@@ -188,7 +199,7 @@ impl User {
     }
 
     pub fn reset_security_stamp(&mut self) {
-        self.security_stamp = crate::util::get_uuid();
+        self.security_stamp = get_uuid();
     }
 
     /// Set the stamp_exception to only allow a subsequent request matching a specific route using the current security-stamp.
@@ -213,20 +224,11 @@ impl User {
     }
 }
 
-use super::{
-    Cipher, Device, EmergencyAccess, Favorite, Folder, Send, TwoFactor, TwoFactorIncomplete, UserOrgType,
-    UserOrganization,
-};
-use crate::db::DbConn;
-
-use crate::api::EmptyResult;
-use crate::error::MapResult;
-
 /// Database methods
 impl User {
     pub async fn to_json(&self, conn: &mut DbConn) -> Value {
         let mut orgs_json = Vec::new();
-        for c in UserOrganization::find_confirmed_by_user(&self.uuid, conn).await {
+        for c in Membership::find_confirmed_by_user(&self.uuid, conn).await {
             orgs_json.push(c.to_json(conn).await);
         }
 
@@ -259,13 +261,14 @@ impl User {
             "forcePasswordReset": false,
             "avatarColor": self.avatar_color,
             "usesKeyConnector": false,
+            "creationDate": format_date(&self.created_at),
             "object": "profile",
         })
     }
 
     pub async fn save(&mut self, conn: &mut DbConn) -> EmptyResult {
-        if self.email.trim().is_empty() {
-            err!("User email can't be empty")
+        if !crate::util::is_valid_email(&self.email) {
+            err!(format!("User email {} is not a valid email address", self.email))
         }
 
         self.updated_at = Utc::now().naive_utc();
@@ -302,19 +305,18 @@ impl User {
     }
 
     pub async fn delete(self, conn: &mut DbConn) -> EmptyResult {
-        for user_org in UserOrganization::find_confirmed_by_user(&self.uuid, conn).await {
-            if user_org.atype == UserOrgType::Owner
-                && UserOrganization::count_confirmed_by_org_and_type(&user_org.org_uuid, UserOrgType::Owner, conn).await
-                    <= 1
+        for member in Membership::find_confirmed_by_user(&self.uuid, conn).await {
+            if member.atype == MembershipType::Owner
+                && Membership::count_confirmed_by_org_and_type(&member.org_uuid, MembershipType::Owner, conn).await <= 1
             {
                 err!("Can't delete last owner")
             }
         }
 
-        Send::delete_all_by_user(&self.uuid, conn).await?;
+        super::Send::delete_all_by_user(&self.uuid, conn).await?;
         EmergencyAccess::delete_all_by_user(&self.uuid, conn).await?;
         EmergencyAccess::delete_all_by_grantee_email(&self.email, conn).await?;
-        UserOrganization::delete_all_by_user(&self.uuid, conn).await?;
+        Membership::delete_all_by_user(&self.uuid, conn).await?;
         Cipher::delete_all_by_user(&self.uuid, conn).await?;
         Favorite::delete_all_by_user(&self.uuid, conn).await?;
         Folder::delete_all_by_user(&self.uuid, conn).await?;
@@ -330,7 +332,7 @@ impl User {
         }}
     }
 
-    pub async fn update_uuid_revision(uuid: &str, conn: &mut DbConn) {
+    pub async fn update_uuid_revision(uuid: &UserId, conn: &mut DbConn) {
         if let Err(e) = Self::_update_revision(uuid, &Utc::now().naive_utc(), conn).await {
             warn!("Failed to update revision for {}: {:#?}", uuid, e);
         }
@@ -340,7 +342,7 @@ impl User {
         let updated_at = Utc::now().naive_utc();
 
         db_run! {conn: {
-            crate::util::retry(|| {
+            retry(|| {
                 diesel::update(users::table)
                     .set(users::updated_at.eq(updated_at))
                     .execute(conn)
@@ -355,9 +357,9 @@ impl User {
         Self::_update_revision(&self.uuid, &self.updated_at, conn).await
     }
 
-    async fn _update_revision(uuid: &str, date: &NaiveDateTime, conn: &mut DbConn) -> EmptyResult {
+    async fn _update_revision(uuid: &UserId, date: &NaiveDateTime, conn: &mut DbConn) -> EmptyResult {
         db_run! {conn: {
-            crate::util::retry(|| {
+            retry(|| {
                 diesel::update(users::table.filter(users::uuid.eq(uuid)))
                     .set(users::updated_at.eq(date))
                     .execute(conn)
@@ -377,7 +379,7 @@ impl User {
         }}
     }
 
-    pub async fn find_by_uuid(uuid: &str, conn: &mut DbConn) -> Option<Self> {
+    pub async fn find_by_uuid(uuid: &UserId, conn: &mut DbConn) -> Option<Self> {
         db_run! {conn: {
             users::table.filter(users::uuid.eq(uuid)).first::<UserDb>(conn).ok().from_db()
         }}
@@ -406,8 +408,8 @@ impl Invitation {
     }
 
     pub async fn save(&self, conn: &mut DbConn) -> EmptyResult {
-        if self.email.trim().is_empty() {
-            err!("Invitation email can't be empty")
+        if !crate::util::is_valid_email(&self.email) {
+            err!(format!("Invitation email {} is not a valid email address", self.email))
         }
 
         db_run! {conn:
@@ -456,3 +458,23 @@ impl Invitation {
         }
     }
 }
+
+#[derive(
+    Clone,
+    Debug,
+    DieselNewType,
+    FromForm,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    AsRef,
+    Deref,
+    Display,
+    From,
+    UuidFromParam,
+)]
+#[deref(forward)]
+#[from(forward)]
+pub struct UserId(String);

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::IpAddr,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -18,7 +19,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
 };
 
-use html5gum::{Emitter, HtmlString, InfallibleTokenizer, Readable, StringReader, Tokenizer};
+use html5gum::{Emitter, HtmlString, Readable, StringReader, Tokenizer};
 
 use crate::{
     error::Error,
@@ -260,11 +261,7 @@ impl Icon {
     }
 }
 
-fn get_favicons_node(
-    dom: InfallibleTokenizer<StringReader<'_>, FaviconEmitter>,
-    icons: &mut Vec<Icon>,
-    url: &url::Url,
-) {
+fn get_favicons_node(dom: Tokenizer<StringReader<'_>, FaviconEmitter>, icons: &mut Vec<Icon>, url: &url::Url) {
     const TAG_LINK: &[u8] = b"link";
     const TAG_BASE: &[u8] = b"base";
     const TAG_HEAD: &[u8] = b"head";
@@ -273,7 +270,7 @@ fn get_favicons_node(
 
     let mut base_url = url.clone();
     let mut icon_tags: Vec<Tag> = Vec::new();
-    for token in dom {
+    for Ok(token) in dom {
         let tag_name: &[u8] = &token.tag.name;
         match tag_name {
             TAG_LINK => {
@@ -294,9 +291,7 @@ fn get_favicons_node(
             TAG_HEAD if token.closing => {
                 break;
             }
-            _ => {
-                continue;
-            }
+            _ => {}
         }
     }
 
@@ -400,7 +395,7 @@ async fn get_icon_url(domain: &str) -> Result<IconUrlResult, Error> {
         // 384KB should be more than enough for the HTML, though as we only really need the HTML header.
         let limited_reader = stream_to_bytes_limit(content, 384 * 1024).await?.to_vec();
 
-        let dom = Tokenizer::new_with_emitter(limited_reader.to_reader(), FaviconEmitter::default()).infallible();
+        let dom = Tokenizer::new_with_emitter(limited_reader.to_reader(), FaviconEmitter::default());
         get_favicons_node(dom, &mut iconlist, &url);
     } else {
         // Add the default favicon.ico to the list with just the given domain
@@ -446,6 +441,9 @@ async fn get_page_with_referer(url: &str, referer: &str) -> Result<Response, Err
 /// priority2 = get_icon_priority("https://example.com/path/to/a/favicon.ico", "");
 /// ```
 fn get_icon_priority(href: &str, sizes: &str) -> u8 {
+    static PRIORITY_MAP: Lazy<HashMap<&'static str, u8>> =
+        Lazy::new(|| [(".png", 10), (".jpg", 20), (".jpeg", 20)].into_iter().collect());
+
     // Check if there is a dimension set
     let (width, height) = parse_sizes(sizes);
 
@@ -470,13 +468,9 @@ fn get_icon_priority(href: &str, sizes: &str) -> u8 {
             200
         }
     } else {
-        // Change priority by file extension
-        if href.ends_with(".png") {
-            10
-        } else if href.ends_with(".jpg") || href.ends_with(".jpeg") {
-            20
-        } else {
-            30
+        match href.rsplit_once('.') {
+            Some((_, extension)) => PRIORITY_MAP.get(&*extension.to_ascii_lowercase()).copied().unwrap_or(30),
+            None => 30,
         }
     }
 }
@@ -623,7 +617,7 @@ use cookie_store::CookieStore;
 pub struct Jar(std::sync::RwLock<CookieStore>);
 
 impl reqwest::cookie::CookieStore for Jar {
-    fn set_cookies(&self, cookie_headers: &mut dyn Iterator<Item = &header::HeaderValue>, url: &url::Url) {
+    fn set_cookies(&self, cookie_headers: &mut dyn Iterator<Item = &HeaderValue>, url: &url::Url) {
         use cookie::{Cookie as RawCookie, ParseError as RawCookieParseError};
         use time::Duration;
 
@@ -642,7 +636,7 @@ impl reqwest::cookie::CookieStore for Jar {
         cookie_store.store_response_cookies(cookies, url);
     }
 
-    fn cookies(&self, url: &url::Url) -> Option<header::HeaderValue> {
+    fn cookies(&self, url: &url::Url) -> Option<HeaderValue> {
         let cookie_store = self.0.read().unwrap();
         let s = cookie_store
             .get_request_values(url)
@@ -654,7 +648,7 @@ impl reqwest::cookie::CookieStore for Jar {
             return None;
         }
 
-        header::HeaderValue::from_maybe_shared(Bytes::from(s)).ok()
+        HeaderValue::from_maybe_shared(Bytes::from(s)).ok()
     }
 }
 
@@ -662,7 +656,7 @@ impl reqwest::cookie::CookieStore for Jar {
 /// The FaviconEmitter is using an optimized version of the DefaultEmitter.
 /// This prevents emitting tags like comments, doctype and also strings between the tags.
 /// But it will also only emit the tags we need and only if they have the correct attributes
-/// Therefor parsing the HTML content is faster.
+/// Therefore parsing the HTML content is faster.
 use std::collections::BTreeMap;
 
 #[derive(Default)]

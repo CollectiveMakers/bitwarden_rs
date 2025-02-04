@@ -13,7 +13,7 @@ jobs:
   # Some checks to determine if we need to continue with building a new docker.
   # We will skip this check if we are creating a tag, because that has the same hash as a previous run already.
   skip_check:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     if: ${{ github.repository == 'dani-garcia/vaultwarden' }}
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
@@ -27,11 +27,16 @@ jobs:
         if: ${{ github.ref_type == 'branch' }}
 
   docker-build:
-    runs-on: ubuntu-22.04
+    permissions:
+      packages: write
+      contents: read
+      attestations: write
+      id-token: write
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     needs: skip_check
     if: ${{ needs.skip_check.outputs.should_skip != 'true' && github.repository == 'dani-garcia/vaultwarden' }}
-    # Start a local docker registry to extract the final Alpine static build binaries
+    # Start a local docker registry to extract the compiled binaries to upload as artifacts and attest them
     services:
       registry:
         image: registry:2
@@ -58,24 +63,24 @@ jobs:
     steps:
       # Checkout the repo
       - name: Checkout
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 #v4.2.2
         with:
           fetch-depth: 0
 
       - name: Initialize QEMU binfmt support
-        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
+        uses: docker/setup-qemu-action@53851d14592bedcffcf25ea515637cff71ef929a # v3.3.0
         with:
           platforms: "arm64,arm"
 
       # Start Docker Buildx
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@aa33708b10e362ff993539393ff100fa93ed6a27 # v3.5.0
+        uses: docker/setup-buildx-action@6524bf65af31da8d45b59e8c27de4bd072b392f5 # v3.8.0
         # https://github.com/moby/buildkit/issues/3969
-        # Also set max parallelism to 3, the default of 4 breaks GitHub Actions and causes OOMKills
+        # Also set max parallelism to 2, the default of 4 breaks GitHub Actions and causes OOMKills
         with:
           buildkitd-config-inline: |
             [worker.oci]
-              max-parallelism = 3
+              max-parallelism = 2
           driver-opts: |
             network=host
 
@@ -159,13 +164,13 @@ jobs:
           #
 
       - name: Add localhost registry
-        if: ${{ matrix.base_image == 'alpine' }}
         shell: bash
         run: |
           echo "CONTAINER_REGISTRIES=${CONTAINER_REGISTRIES:+${CONTAINER_REGISTRIES},}localhost:5000/vaultwarden/server" | tee -a "${GITHUB_ENV}"
 
       - name: Bake ${{ matrix.base_image }} containers
-        uses: docker/bake-action@a4d7f0b5b91c14a296d792d4ec53a9db17f02e67 # v5.5.0
+        id: bake_vw
+        uses: docker/bake-action@5ca506d06f70338a4968df87fd8bfee5cbfb84c7 # v6.0.0
         env:
           BASE_TAGS: "${{ env.BASE_TAGS }}"
           SOURCE_COMMIT: "${{ env.SOURCE_COMMIT }}"
@@ -175,16 +180,47 @@ jobs:
         with:
           pull: true
           push: true
+          source: .
           files: docker/docker-bake.hcl
           targets: "${{ matrix.base_image }}-multi"
           set: |
             *.cache-from=${{ env.BAKE_CACHE_FROM }}
             *.cache-to=${{ env.BAKE_CACHE_TO }}
 
+      - name: Extract digest SHA
+        shell: bash
+        run: |
+          GET_DIGEST_SHA="$(jq -r '.["${{ matrix.base_image }}-multi"]."containerimage.digest"' <<< '${{ steps.bake_vw.outputs.metadata }}')"
+          echo "DIGEST_SHA=${GET_DIGEST_SHA}" | tee -a "${GITHUB_ENV}"
+
+      # Attest container images
+      - name: Attest - docker.io - ${{ matrix.base_image }}
+        if: ${{ env.HAVE_DOCKERHUB_LOGIN == 'true' && steps.bake_vw.outputs.metadata != ''}}
+        uses: actions/attest-build-provenance@7668571508540a607bdfd90a87a560489fe372eb # v2.1.0
+        with:
+          subject-name: ${{ vars.DOCKERHUB_REPO }}
+          subject-digest: ${{ env.DIGEST_SHA }}
+          push-to-registry: true
+
+      - name: Attest - ghcr.io - ${{ matrix.base_image }}
+        if: ${{ env.HAVE_GHCR_LOGIN == 'true' && steps.bake_vw.outputs.metadata != ''}}
+        uses: actions/attest-build-provenance@7668571508540a607bdfd90a87a560489fe372eb # v2.1.0
+        with:
+          subject-name: ${{ vars.GHCR_REPO }}
+          subject-digest: ${{ env.DIGEST_SHA }}
+          push-to-registry: true
+
+      - name: Attest - quay.io - ${{ matrix.base_image }}
+        if: ${{ env.HAVE_QUAY_LOGIN == 'true' && steps.bake_vw.outputs.metadata != ''}}
+        uses: actions/attest-build-provenance@7668571508540a607bdfd90a87a560489fe372eb # v2.1.0
+        with:
+          subject-name: ${{ vars.QUAY_REPO }}
+          subject-digest: ${{ env.DIGEST_SHA }}
+          push-to-registry: true
+
 
       # Extract the Alpine binaries from the containers
       - name: Extract binaries
-        if: ${{ matrix.base_image == 'alpine' }}
         shell: bash
         run: |
           # Check which main tag we are going to build determined by github.ref_type
@@ -194,59 +230,65 @@ jobs:
             EXTRACT_TAG="testing"
           fi
 
+          # Check which base_image was used and append -alpine if needed
+          if [[ "${{ matrix.base_image }}" == "alpine" ]]; then
+            EXTRACT_TAG="${EXTRACT_TAG}-alpine"
+          fi
+
           # After each extraction the image is removed.
           # This is needed because using different platforms doesn't trigger a new pull/download
 
           # Extract amd64 binary
-          docker create --name amd64 --platform=linux/amd64 "localhost:5000/vaultwarden/server:${EXTRACT_TAG}-alpine"
-          docker cp amd64:/vaultwarden vaultwarden-amd64
+          docker create --name amd64 --platform=linux/amd64 "localhost:5000/vaultwarden/server:${EXTRACT_TAG}"
+          docker cp amd64:/vaultwarden vaultwarden-amd64-${{ matrix.base_image }}
           docker rm --force amd64
-          docker rmi --force "localhost:5000/vaultwarden/server:${EXTRACT_TAG}-alpine"
+          docker rmi --force "localhost:5000/vaultwarden/server:${EXTRACT_TAG}"
 
           # Extract arm64 binary
-          docker create --name arm64 --platform=linux/arm64 "localhost:5000/vaultwarden/server:${EXTRACT_TAG}-alpine"
-          docker cp arm64:/vaultwarden vaultwarden-arm64
+          docker create --name arm64 --platform=linux/arm64 "localhost:5000/vaultwarden/server:${EXTRACT_TAG}"
+          docker cp arm64:/vaultwarden vaultwarden-arm64-${{ matrix.base_image }}
           docker rm --force arm64
-          docker rmi --force "localhost:5000/vaultwarden/server:${EXTRACT_TAG}-alpine"
+          docker rmi --force "localhost:5000/vaultwarden/server:${EXTRACT_TAG}"
 
           # Extract armv7 binary
-          docker create --name armv7 --platform=linux/arm/v7 "localhost:5000/vaultwarden/server:${EXTRACT_TAG}-alpine"
-          docker cp armv7:/vaultwarden vaultwarden-armv7
+          docker create --name armv7 --platform=linux/arm/v7 "localhost:5000/vaultwarden/server:${EXTRACT_TAG}"
+          docker cp armv7:/vaultwarden vaultwarden-armv7-${{ matrix.base_image }}
           docker rm --force armv7
-          docker rmi --force "localhost:5000/vaultwarden/server:${EXTRACT_TAG}-alpine"
+          docker rmi --force "localhost:5000/vaultwarden/server:${EXTRACT_TAG}"
 
           # Extract armv6 binary
-          docker create --name armv6 --platform=linux/arm/v6 "localhost:5000/vaultwarden/server:${EXTRACT_TAG}-alpine"
-          docker cp armv6:/vaultwarden vaultwarden-armv6
+          docker create --name armv6 --platform=linux/arm/v6 "localhost:5000/vaultwarden/server:${EXTRACT_TAG}"
+          docker cp armv6:/vaultwarden vaultwarden-armv6-${{ matrix.base_image }}
           docker rm --force armv6
-          docker rmi --force "localhost:5000/vaultwarden/server:${EXTRACT_TAG}-alpine"
+          docker rmi --force "localhost:5000/vaultwarden/server:${EXTRACT_TAG}"
 
-      # Upload artifacts to Github Actions
-      - name: "Upload amd64 artifact"
-        uses: actions/upload-artifact@0b2256b8c012f0828dc542b3febcab082c67f72b # v4.3.4
-        if: ${{ matrix.base_image == 'alpine' }}
+      # Upload artifacts to Github Actions and Attest the binaries
+      - name: "Upload amd64 artifact ${{ matrix.base_image }}"
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b #v4.5.0
         with:
-          name: vaultwarden-${{ env.SOURCE_VERSION }}-linux-amd64
-          path: vaultwarden-amd64
+          name: vaultwarden-${{ env.SOURCE_VERSION }}-linux-amd64-${{ matrix.base_image }}
+          path: vaultwarden-amd64-${{ matrix.base_image }}
 
-      - name: "Upload arm64 artifact"
-        uses: actions/upload-artifact@0b2256b8c012f0828dc542b3febcab082c67f72b # v4.3.4
-        if: ${{ matrix.base_image == 'alpine' }}
+      - name: "Upload arm64 artifact ${{ matrix.base_image }}"
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b #v4.5.0
         with:
-          name: vaultwarden-${{ env.SOURCE_VERSION }}-linux-arm64
-          path: vaultwarden-arm64
+          name: vaultwarden-${{ env.SOURCE_VERSION }}-linux-arm64-${{ matrix.base_image }}
+          path: vaultwarden-arm64-${{ matrix.base_image }}
 
-      - name: "Upload armv7 artifact"
-        uses: actions/upload-artifact@0b2256b8c012f0828dc542b3febcab082c67f72b # v4.3.4
-        if: ${{ matrix.base_image == 'alpine' }}
+      - name: "Upload armv7 artifact ${{ matrix.base_image }}"
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b #v4.5.0
         with:
-          name: vaultwarden-${{ env.SOURCE_VERSION }}-linux-armv7
-          path: vaultwarden-armv7
+          name: vaultwarden-${{ env.SOURCE_VERSION }}-linux-armv7-${{ matrix.base_image }}
+          path: vaultwarden-armv7-${{ matrix.base_image }}
 
-      - name: "Upload armv6 artifact"
-        uses: actions/upload-artifact@0b2256b8c012f0828dc542b3febcab082c67f72b # v4.3.4
-        if: ${{ matrix.base_image == 'alpine' }}
+      - name: "Upload armv6 artifact ${{ matrix.base_image }}"
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b #v4.5.0
         with:
-          name: vaultwarden-${{ env.SOURCE_VERSION }}-linux-armv6
-          path: vaultwarden-armv6
+          name: vaultwarden-${{ env.SOURCE_VERSION }}-linux-armv6-${{ matrix.base_image }}
+          path: vaultwarden-armv6-${{ matrix.base_image }}
+
+      - name: "Attest artifacts ${{ matrix.base_image }}"
+        uses: actions/attest-build-provenance@7668571508540a607bdfd90a87a560489fe372eb # v2.1.0
+        with:
+          subject-path: vaultwarden-*
       # End Upload artifacts to Github Actions
