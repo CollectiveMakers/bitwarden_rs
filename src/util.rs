@@ -1,13 +1,12 @@
 //
 // Web Headers and caching
 //
-use std::{collections::HashMap, io::Cursor, ops::Deref, path::Path};
+use std::{collections::HashMap, io::Cursor, path::Path};
 
 use num_traits::ToPrimitive;
 use rocket::{
     fairing::{Fairing, Info, Kind},
     http::{ContentType, Header, HeaderMap, Method, Status},
-    request::FromParam,
     response::{self, Responder},
     Data, Orbit, Request, Response, Rocket,
 };
@@ -51,9 +50,16 @@ impl Fairing for AppHeaders {
             }
         }
 
+        // NOTE: When modifying or adding security headers be sure to also update the diagnostic checks in `src/static/scripts/admin_diagnostics.js` in `checkSecurityHeaders`
         res.set_raw_header("Permissions-Policy", "accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=()");
         res.set_raw_header("Referrer-Policy", "same-origin");
         res.set_raw_header("X-Content-Type-Options", "nosniff");
+        res.set_raw_header("X-Robots-Tag", "noindex, nofollow");
+
+        if !res.headers().get_one("Content-Type").is_some_and(|v| v.starts_with("image/")) {
+            res.set_raw_header("Cross-Origin-Resource-Policy", "same-origin");
+        }
+
         // Obsolete in modern browsers, unsafe (XS-Leak), and largely replaced by CSP
         res.set_raw_header("X-XSS-Protection", "0");
 
@@ -73,7 +79,9 @@ impl Fairing for AppHeaders {
             // # Mail Relay: https://bitwarden.com/blog/add-privacy-and-security-using-email-aliases-with-bitwarden/
             // app.simplelogin.io, app.addy.io, api.fastmail.com, quack.duckduckgo.com
             let csp = format!(
-                "default-src 'self'; \
+                "default-src 'none'; \
+                font-src 'self'; \
+                manifest-src 'self'; \
                 base-uri 'self'; \
                 form-action 'self'; \
                 object-src 'self' blob:; \
@@ -96,10 +104,11 @@ impl Fairing for AppHeaders {
                   https://app.addy.io/api/ \
                   https://api.fastmail.com/ \
                   https://api.forwardemail.net \
-                  ;\
+                  {allowed_connect_src};\
                 ",
                 icon_service_csp = CONFIG._icon_service_csp(),
-                allowed_iframe_ancestors = CONFIG.allowed_iframe_ancestors()
+                allowed_iframe_ancestors = CONFIG.allowed_iframe_ancestors(),
+                allowed_connect_src = CONFIG.allowed_connect_src(),
             );
             res.set_raw_header("Content-Security-Policy", csp);
             res.set_raw_header("X-Frame-Options", "SAMEORIGIN");
@@ -213,46 +222,10 @@ impl<'r, R: 'r + Responder<'r, 'static> + Send> Responder<'r, 'static> for Cache
         };
         res.set_raw_header("Cache-Control", cache_control_header);
 
-        let time_now = chrono::Local::now();
+        let time_now = Local::now();
         let expiry_time = time_now + chrono::TimeDelta::try_seconds(self.ttl.try_into().unwrap()).unwrap();
         res.set_raw_header("Expires", format_datetime_http(&expiry_time));
         Ok(res)
-    }
-}
-
-pub struct SafeString(String);
-
-impl std::fmt::Display for SafeString {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl Deref for SafeString {
-    type Target = String;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl AsRef<Path> for SafeString {
-    #[inline]
-    fn as_ref(&self) -> &Path {
-        Path::new(&self.0)
-    }
-}
-
-impl<'r> FromParam<'r> for SafeString {
-    type Error = ();
-
-    #[inline(always)]
-    fn from_param(param: &'r str) -> Result<Self, Self::Error> {
-        if param.chars().all(|c| matches!(c, 'a'..='z' | 'A'..='Z' |'0'..='9' | '-')) {
-            Ok(SafeString(param.to_string()))
-        } else {
-            Err(())
-        }
     }
 }
 
@@ -438,13 +411,19 @@ pub fn get_env_bool(key: &str) -> Option<bool> {
 
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 
-// Format used by Bitwarden API
-const DATETIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
-
 /// Formats a UTC-offset `NaiveDateTime` in the format used by Bitwarden API
 /// responses with "date" fields (`CreationDate`, `RevisionDate`, etc.).
 pub fn format_date(dt: &NaiveDateTime) -> String {
-    dt.format(DATETIME_FORMAT).to_string()
+    dt.and_utc().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+/// Validates and formats a RFC3339 timestamp
+/// If parsing fails it will return the start of the unix datetime
+pub fn validate_and_format_date(dt: &str) -> String {
+    match DateTime::parse_from_rfc3339(dt) {
+        Ok(dt) => dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        _ => String::from("1970-01-01T00:00:00.000000Z"),
+    }
 }
 
 /// Formats a `DateTime<Local>` using the specified format string.
@@ -486,7 +465,24 @@ pub fn format_datetime_http(dt: &DateTime<Local>) -> String {
 }
 
 pub fn parse_date(date: &str) -> NaiveDateTime {
-    NaiveDateTime::parse_from_str(date, DATETIME_FORMAT).unwrap()
+    DateTime::parse_from_rfc3339(date).unwrap().naive_utc()
+}
+
+/// Returns true or false if an email address is valid or not
+///
+/// Some extra checks instead of only using email_address
+/// This prevents from weird email formats still excepted but in the end invalid
+pub fn is_valid_email(email: &str) -> bool {
+    let Ok(email) = email_address::EmailAddress::from_str(email) else {
+        return false;
+    };
+    let Ok(email_url) = url::Url::parse(&format!("https://{}", email.domain())) else {
+        return false;
+    };
+    if email_url.path().ne("/") || email_url.domain().is_none() || email_url.query().is_some() {
+        return false;
+    }
+    true
 }
 
 //
@@ -511,6 +507,28 @@ pub fn container_base_image() -> &'static str {
     } else {
         "Unknown"
     }
+}
+
+#[derive(Deserialize)]
+struct WebVaultVersion {
+    version: String,
+}
+
+pub fn get_web_vault_version() -> String {
+    let version_files = [
+        format!("{}/vw-version.json", CONFIG.web_vault_folder()),
+        format!("{}/version.json", CONFIG.web_vault_folder()),
+    ];
+
+    for version_file in version_files {
+        if let Ok(version_str) = std::fs::read_to_string(&version_file) {
+            if let Ok(version) = serde_json::from_str::<WebVaultVersion>(&version_str) {
+                return String::from(version.version.trim_start_matches('v'));
+            }
+        }
+    }
+
+    String::from("Version file missing")
 }
 
 //
@@ -590,7 +608,7 @@ impl<'de> Visitor<'de> for LowerCaseVisitor {
 fn _process_key(key: &str) -> String {
     match key.to_lowercase().as_ref() {
         "ssn" => "ssn".into(),
-        _ => self::lcase_first(key),
+        _ => lcase_first(key),
     }
 }
 

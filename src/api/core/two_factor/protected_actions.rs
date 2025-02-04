@@ -6,7 +6,7 @@ use crate::{
     auth::Headers,
     crypto,
     db::{
-        models::{TwoFactor, TwoFactorType},
+        models::{TwoFactor, TwoFactorType, UserId},
         DbConn,
     },
     error::{Error, MapResult},
@@ -42,7 +42,7 @@ impl ProtectedActionData {
     }
 
     pub fn from_json(string: &str) -> Result<Self, Error> {
-        let res: Result<Self, crate::serde_json::Error> = serde_json::from_str(string);
+        let res: Result<Self, serde_json::Error> = serde_json::from_str(string);
         match res {
             Ok(x) => Ok(x),
             Err(_) => err!("Could not decode ProtectedActionData from string"),
@@ -104,11 +104,11 @@ async fn verify_otp(data: Json<ProtectedActionVerify>, headers: Headers, mut con
 
 pub async fn validate_protected_action_otp(
     otp: &str,
-    user_uuid: &str,
+    user_id: &UserId,
     delete_if_valid: bool,
     conn: &mut DbConn,
 ) -> EmptyResult {
-    let pa = TwoFactor::find_by_user_and_type(user_uuid, TwoFactorType::ProtectedActions as i32, conn)
+    let pa = TwoFactor::find_by_user_and_type(user_id, TwoFactorType::ProtectedActions as i32, conn)
         .await
         .map_res("Protected action token not found, try sending the code again or restart the process")?;
     let mut pa_data = ProtectedActionData::from_json(&pa.data)?;

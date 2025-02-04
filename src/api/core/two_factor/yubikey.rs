@@ -49,7 +49,7 @@ fn parse_yubikeys(data: &EnableYubikeyData) -> Vec<String> {
     data_keys.iter().filter_map(|e| e.as_ref().cloned()).collect()
 }
 
-fn jsonify_yubikeys(yubikeys: Vec<String>) -> serde_json::Value {
+fn jsonify_yubikeys(yubikeys: Vec<String>) -> Value {
     let mut result = Value::Object(serde_json::Map::new());
 
     for (i, key) in yubikeys.into_iter().enumerate() {
@@ -92,10 +92,10 @@ async fn generate_yubikey(data: Json<PasswordOrOtpData>, headers: Headers, mut c
 
     data.validate(&user, false, &mut conn).await?;
 
-    let user_uuid = &user.uuid;
+    let user_id = &user.uuid;
     let yubikey_type = TwoFactorType::YubiKey as i32;
 
-    let r = TwoFactor::find_by_user_and_type(user_uuid, yubikey_type, &mut conn).await;
+    let r = TwoFactor::find_by_user_and_type(user_id, yubikey_type, &mut conn).await;
 
     if let Some(r) = r {
         let yubikey_metadata: YubikeyMetadata = serde_json::from_str(&r.data)?;

@@ -24,6 +24,8 @@ extern crate log;
 extern crate diesel;
 #[macro_use]
 extern crate diesel_migrations;
+#[macro_use]
+extern crate diesel_derive_newtype;
 
 use std::{
     collections::HashMap,
@@ -39,6 +41,9 @@ use tokio::{
     fs::File,
     io::{AsyncBufReadExt, BufReader},
 };
+
+#[cfg(unix)]
+use tokio::signal::unix::SignalKind;
 
 #[macro_use]
 mod error;
@@ -59,12 +64,12 @@ use crate::api::{WS_ANONYMOUS_SUBSCRIPTIONS, WS_USERS};
 pub use config::CONFIG;
 pub use error::{Error, MapResult};
 use rocket::data::{Limits, ToByteUnit};
-use std::sync::Arc;
+use std::sync::{atomic::Ordering, Arc};
 pub use util::is_running_in_container;
 
 #[rocket::main]
 async fn main() -> Result<(), Error> {
-    parse_args();
+    parse_args().await;
     launch_info();
 
     let level = init_logging()?;
@@ -83,7 +88,7 @@ async fn main() -> Result<(), Error> {
 
     let pool = create_db_pool().await;
     schedule_jobs(pool.clone());
-    crate::db::models::TwoFactor::migrate_u2f_to_webauthn(&mut pool.get().await.unwrap()).await.unwrap();
+    db::models::TwoFactor::migrate_u2f_to_webauthn(&mut pool.get().await.unwrap()).await.unwrap();
 
     let extra_debug = matches!(level, log::LevelFilter::Trace | log::LevelFilter::Debug);
     launch_rocket(pool, extra_debug).await // Blocks until program termination.
@@ -97,10 +102,12 @@ USAGE:
 
 FLAGS:
     -h, --help       Prints help information
-    -v, --version    Prints the app version
+    -v, --version    Prints the app and web-vault version
 
 COMMAND:
     hash [--preset {bitwarden|owasp}]  Generate an Argon2id PHC ADMIN_TOKEN
+    backup                             Create a backup of the SQLite database
+                                       You can also send the USR1 signal to trigger a backup
 
 PRESETS:                  m=         t=          p=
     bitwarden (default) 64MiB, 3 Iterations, 4 Threads
@@ -110,16 +117,19 @@ PRESETS:                  m=         t=          p=
 
 pub const VERSION: Option<&str> = option_env!("VW_VERSION");
 
-fn parse_args() {
+async fn parse_args() {
     let mut pargs = pico_args::Arguments::from_env();
     let version = VERSION.unwrap_or("(Version info from Git not present)");
 
     if pargs.contains(["-h", "--help"]) {
-        println!("vaultwarden {version}");
+        println!("Vaultwarden {version}");
         print!("{HELP}");
         exit(0);
     } else if pargs.contains(["-v", "--version"]) {
-        println!("vaultwarden {version}");
+        config::SKIP_CONFIG_VALIDATION.store(true, Ordering::Relaxed);
+        let web_vault_version = util::get_web_vault_version();
+        println!("Vaultwarden {version}");
+        println!("Web-Vault {web_vault_version}");
         exit(0);
     }
 
@@ -163,7 +173,7 @@ fn parse_args() {
             }
 
             let argon2 = Argon2::new(Argon2id, V0x13, argon2_params.build().unwrap());
-            let salt = SaltString::encode_b64(&crate::crypto::get_random_bytes::<32>()).unwrap();
+            let salt = SaltString::encode_b64(&crypto::get_random_bytes::<32>()).unwrap();
 
             let argon2_timer = tokio::time::Instant::now();
             if let Ok(password_hash) = argon2.hash_password(password.as_bytes(), &salt) {
@@ -174,13 +184,42 @@ fn parse_args() {
                     argon2_timer.elapsed()
                 );
             } else {
-                error!("Unable to generate Argon2id PHC hash.");
+                println!("Unable to generate Argon2id PHC hash.");
                 exit(1);
+            }
+        } else if command == "backup" {
+            match backup_sqlite().await {
+                Ok(f) => {
+                    println!("Backup to '{f}' was successful");
+                    exit(0);
+                }
+                Err(e) => {
+                    println!("Backup failed. {e:?}");
+                    exit(1);
+                }
             }
         }
         exit(0);
     }
 }
+
+async fn backup_sqlite() -> Result<String, Error> {
+    use crate::db::{backup_database, DbConnType};
+    if DbConnType::from_url(&CONFIG.database_url()).map(|t| t == DbConnType::sqlite).unwrap_or(false) {
+        // Establish a connection to the sqlite database
+        let mut conn = db::DbPool::from_config()
+            .expect("SQLite database connection failed")
+            .get()
+            .await
+            .expect("Unable to get SQLite db pool");
+
+        let backup_file = backup_database(&mut conn).await?;
+        Ok(backup_file)
+    } else {
+        err_silent!("The database type is not SQLite. Backups only works for SQLite databases")
+    }
+}
+
 fn launch_info() {
     println!(
         "\
@@ -344,15 +383,15 @@ fn init_logging() -> Result<log::LevelFilter, Error> {
         {
             logger = logger.chain(fern::log_file(log_file)?);
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
-            const SIGHUP: i32 = tokio::signal::unix::SignalKind::hangup().as_raw_value();
+            const SIGHUP: i32 = SignalKind::hangup().as_raw_value();
             let path = Path::new(&log_file);
             logger = logger.chain(fern::log_reopen1(path, [SIGHUP])?);
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
         if cfg!(feature = "enable_syslog") || CONFIG.use_syslog() {
             logger = chain_syslog(logger);
@@ -402,7 +441,7 @@ fn init_logging() -> Result<log::LevelFilter, Error> {
     Ok(level)
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 fn chain_syslog(logger: fern::Dispatch) -> fern::Dispatch {
     let syslog_fmt = syslog::Formatter3164 {
         facility: syslog::Facility::LOG_USER,
@@ -474,10 +513,10 @@ async fn container_data_folder_is_persistent(data_folder: &str) -> bool {
             format!(" /{data_folder} ")
         };
         let mut lines = BufReader::new(mountinfo).lines();
+        let re = regex::Regex::new(r"/volumes/[a-z0-9]{64}/_data /").unwrap();
         while let Some(line) = lines.next_line().await.unwrap_or_default() {
             // Only execute a regex check if we find the base match
             if line.contains(&data_folder_match) {
-                let re = regex::Regex::new(r"/volumes/[a-z0-9]{64}/_data /").unwrap();
                 if re.is_match(&line) {
                     return false;
                 }
@@ -560,7 +599,23 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
         CONFIG.shutdown();
     });
 
-    let _ = instance.launch().await?;
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            let mut signal_user1 = tokio::signal::unix::signal(SignalKind::user_defined1()).unwrap();
+            loop {
+                // If we need more signals to act upon, we might want to use select! here.
+                // With only one item to listen for this is enough.
+                let _ = signal_user1.recv().await;
+                match backup_sqlite().await {
+                    Ok(f) => info!("Backup to '{f}' was successful"),
+                    Err(e) => error!("Backup failed. {e:?}"),
+                }
+            }
+        });
+    }
+
+    instance.launch().await?;
 
     info!("Vaultwarden process exited!");
     Ok(())
