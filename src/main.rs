@@ -1,9 +1,8 @@
 #![cfg_attr(feature = "unstable", feature(ip))]
 // The recursion_limit is mainly triggered by the json!() macro.
 // The more key/value pairs there are the more recursion occurs.
-// We want to keep this as low as possible, but not higher then 128.
-// If you go above 128 it will cause rust-analyzer to fail,
-#![recursion_limit = "200"]
+// We want to keep this as low as possible!
+#![recursion_limit = "165"]
 
 // When enabled use MiMalloc as malloc instead of the default malloc
 #[cfg(feature = "enable_mimalloc")]
@@ -56,12 +55,14 @@ mod db;
 mod http_client;
 mod mail;
 mod ratelimit;
+mod sso;
+mod sso_client;
 mod util;
 
 use crate::api::core::two_factor::duo_oidc::purge_duo_contexts;
 use crate::api::purge_auth_requests;
 use crate::api::{WS_ANONYMOUS_SUBSCRIPTIONS, WS_USERS};
-pub use config::CONFIG;
+pub use config::{PathType, CONFIG};
 pub use error::{Error, MapResult};
 use rocket::data::{Limits, ToByteUnit};
 use std::sync::{atomic::Ordering, Arc};
@@ -69,26 +70,24 @@ pub use util::is_running_in_container;
 
 #[rocket::main]
 async fn main() -> Result<(), Error> {
-    parse_args().await;
+    parse_args();
     launch_info();
 
     let level = init_logging()?;
 
     check_data_folder().await;
-    auth::initialize_keys().unwrap_or_else(|e| {
+    auth::initialize_keys().await.unwrap_or_else(|e| {
         error!("Error creating private key '{}'\n{e:?}\nExiting Vaultwarden!", CONFIG.private_rsa_key());
         exit(1);
     });
     check_web_vault();
 
-    create_dir(&CONFIG.icon_cache_folder(), "icon cache");
     create_dir(&CONFIG.tmp_folder(), "tmp folder");
-    create_dir(&CONFIG.sends_folder(), "sends folder");
-    create_dir(&CONFIG.attachments_folder(), "attachments folder");
 
     let pool = create_db_pool().await;
     schedule_jobs(pool.clone());
-    db::models::TwoFactor::migrate_u2f_to_webauthn(&mut pool.get().await.unwrap()).await.unwrap();
+    db::models::TwoFactor::migrate_u2f_to_webauthn(&pool.get().await.unwrap()).await.unwrap();
+    db::models::TwoFactor::migrate_credential_to_passkey(&pool.get().await.unwrap()).await.unwrap();
 
     let extra_debug = matches!(level, log::LevelFilter::Trace | log::LevelFilter::Debug);
     launch_rocket(pool, extra_debug).await // Blocks until program termination.
@@ -117,7 +116,7 @@ PRESETS:                  m=         t=          p=
 
 pub const VERSION: Option<&str> = option_env!("VW_VERSION");
 
-async fn parse_args() {
+fn parse_args() {
     let mut pargs = pico_args::Arguments::from_env();
     let version = VERSION.unwrap_or("(Version info from Git not present)");
 
@@ -127,7 +126,7 @@ async fn parse_args() {
         exit(0);
     } else if pargs.contains(["-v", "--version"]) {
         config::SKIP_CONFIG_VALIDATION.store(true, Ordering::Relaxed);
-        let web_vault_version = util::get_web_vault_version();
+        let web_vault_version = util::get_active_web_release();
         println!("Vaultwarden {version}");
         println!("Web-Vault {web_vault_version}");
         exit(0);
@@ -188,7 +187,7 @@ async fn parse_args() {
                 exit(1);
             }
         } else if command == "backup" {
-            match backup_sqlite().await {
+            match db::backup_sqlite() {
                 Ok(f) => {
                     println!("Backup to '{f}' was successful");
                     exit(0);
@@ -200,23 +199,6 @@ async fn parse_args() {
             }
         }
         exit(0);
-    }
-}
-
-async fn backup_sqlite() -> Result<String, Error> {
-    use crate::db::{backup_database, DbConnType};
-    if DbConnType::from_url(&CONFIG.database_url()).map(|t| t == DbConnType::sqlite).unwrap_or(false) {
-        // Establish a connection to the sqlite database
-        let mut conn = db::DbPool::from_config()
-            .expect("SQLite database connection failed")
-            .get()
-            .await
-            .expect("Unable to get SQLite db pool");
-
-        let backup_file = backup_database(&mut conn).await?;
-        Ok(backup_file)
-    } else {
-        err_silent!("The database type is not SQLite. Backups only works for SQLite databases")
     }
 }
 
@@ -264,8 +246,8 @@ fn init_logging() -> Result<log::LevelFilter, Error> {
                     .split(',')
                     .collect::<Vec<&str>>()
                     .into_iter()
-                    .flat_map(|s| match s.split('=').collect::<Vec<&str>>()[..] {
-                        [log, lvl_str] => log::LevelFilter::from_str(lvl_str).ok().map(|lvl| (log, lvl)),
+                    .flat_map(|s| match s.split_once('=') {
+                        Some((log, lvl_str)) => log::LevelFilter::from_str(lvl_str).ok().map(|lvl| (log, lvl)),
                         _ => None,
                     })
                     .collect()
@@ -284,13 +266,6 @@ fn init_logging() -> Result<log::LevelFilter, Error> {
     } else {
         log::LevelFilter::Off
     };
-
-    let diesel_logger_level: log::LevelFilter =
-        if cfg!(feature = "query_logger") && std::env::var("QUERY_LOGGER").is_ok() {
-            log::LevelFilter::Debug
-        } else {
-            log::LevelFilter::Off
-        };
 
     // Only show Rocket underscore `_` logs when the level is Debug or higher
     // Else this will bloat the log output with useless messages.
@@ -342,9 +317,15 @@ fn init_logging() -> Result<log::LevelFilter, Error> {
         // Variable level for hickory used by reqwest
         ("hickory_resolver::name_server::name_server", hickory_level),
         ("hickory_proto::xfer", hickory_level),
-        ("diesel_logger", diesel_logger_level),
         // SMTP
         ("lettre::transport::smtp", smtp_log_level),
+        // Set query_logger default to Off, but can be overwritten manually
+        // You can set LOG_LEVEL=info,vaultwarden::db::query_logger=<LEVEL> to overwrite it.
+        // This makes it possible to do the following:
+        // warn = Print slow queries only, 5 seconds or longer
+        // info = Print slow queries only, 1 second or longer
+        // debug = Print all queries
+        ("vaultwarden::db::query_logger", log::LevelFilter::Off),
     ]);
 
     for (path, level) in levels_override.into_iter() {
@@ -430,10 +411,7 @@ fn init_logging() -> Result<log::LevelFilter, Error> {
             }
             None => error!(
                 target: "panic",
-                "thread '{}' panicked at '{}'\n{:}",
-                thread,
-                msg,
-                backtrace
+                "thread '{thread}' panicked at '{msg}'\n{backtrace:}"
             ),
         }
     }));
@@ -453,7 +431,7 @@ fn chain_syslog(logger: fern::Dispatch) -> fern::Dispatch {
     match syslog::unix(syslog_fmt) {
         Ok(sl) => logger.chain(sl),
         Err(e) => {
-            error!("Unable to connect to syslog: {:?}", e);
+            error!("Unable to connect to syslog: {e:?}");
             logger
         }
     }
@@ -467,9 +445,27 @@ fn create_dir(path: &str, description: &str) {
 
 async fn check_data_folder() {
     let data_folder = &CONFIG.data_folder();
+
+    if data_folder.starts_with("s3://") {
+        if let Err(e) = CONFIG
+            .opendal_operator_for_path_type(&PathType::Data)
+            .unwrap_or_else(|e| {
+                error!("Failed to create S3 operator for data folder '{data_folder}': {e:?}");
+                exit(1);
+            })
+            .check()
+            .await
+        {
+            error!("Could not access S3 data folder '{data_folder}': {e:?}");
+            exit(1);
+        }
+
+        return;
+    }
+
     let path = Path::new(data_folder);
     if !path.exists() {
-        error!("Data folder '{}' doesn't exist.", data_folder);
+        error!("Data folder '{data_folder}' doesn't exist.");
         if is_running_in_container() {
             error!("Verify that your data volume is mounted at the correct location.");
         } else {
@@ -478,7 +474,7 @@ async fn check_data_folder() {
         exit(1);
     }
     if !path.is_dir() {
-        error!("Data folder '{}' is not a directory.", data_folder);
+        error!("Data folder '{data_folder}' is not a directory.");
         exit(1);
     }
 
@@ -552,7 +548,7 @@ async fn create_db_pool() -> db::DbPool {
     match util::retry_db(db::DbPool::from_config, CONFIG.db_connection_retries()).await {
         Ok(p) => p,
         Err(e) => {
-            error!("Error creating database pool: {:?}", e);
+            error!("Error creating database pool: {e:?}");
             exit(1);
         }
     }
@@ -599,20 +595,24 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
         CONFIG.shutdown();
     });
 
-    #[cfg(unix)]
+    #[cfg(all(unix, sqlite))]
     {
-        tokio::spawn(async move {
-            let mut signal_user1 = tokio::signal::unix::signal(SignalKind::user_defined1()).unwrap();
-            loop {
-                // If we need more signals to act upon, we might want to use select! here.
-                // With only one item to listen for this is enough.
-                let _ = signal_user1.recv().await;
-                match backup_sqlite().await {
-                    Ok(f) => info!("Backup to '{f}' was successful"),
-                    Err(e) => error!("Backup failed. {e:?}"),
+        if db::ACTIVE_DB_TYPE.get() != Some(&db::DbConnType::Sqlite) {
+            debug!("PostgreSQL and MySQL/MariaDB do not support this backup feature, skip adding USR1 signal.");
+        } else {
+            tokio::spawn(async move {
+                let mut signal_user1 = tokio::signal::unix::signal(SignalKind::user_defined1()).unwrap();
+                loop {
+                    // If we need more signals to act upon, we might want to use select! here.
+                    // With only one item to listen for this is enough.
+                    let _ = signal_user1.recv().await;
+                    match db::backup_sqlite() {
+                        Ok(f) => info!("Backup to '{f}' was successful"),
+                        Err(e) => error!("Backup failed. {e:?}"),
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     instance.launch().await?;
@@ -696,6 +696,13 @@ fn schedule_jobs(pool: db::DbPool) {
             {
                 sched.add(Job::new(CONFIG.event_cleanup_schedule().parse().unwrap(), || {
                     runtime.spawn(api::event_cleanup_job(pool.clone()));
+                }));
+            }
+
+            // Purge sso auth from incomplete flow (default to daily at 00h20).
+            if !CONFIG.purge_incomplete_sso_auth().is_empty() {
+                sched.add(Job::new(CONFIG.purge_incomplete_sso_auth().parse().unwrap(), || {
+                    runtime.spawn(db::models::SsoAuth::delete_expired(pool.clone()));
                 }));
             }
 

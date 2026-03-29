@@ -50,11 +50,15 @@ pub fn events_routes() -> Vec<Route> {
 use rocket::{serde::json::Json, serde::json::Value, Catcher, Route};
 
 use crate::{
-    api::{JsonResult, Notify, UpdateType},
+    api::{EmptyResult, JsonResult, Notify, UpdateType},
     auth::Headers,
-    db::DbConn,
+    db::{
+        models::{Membership, MembershipStatus, OrgPolicy, Organization, User},
+        DbConn,
+    },
     error::Error,
     http_client::make_http_request,
+    mail,
     util::parse_experimental_client_feature_flags,
 };
 
@@ -70,11 +74,11 @@ const GLOBAL_DOMAINS: &str = include_str!("../../static/global_domains.json");
 
 #[get("/settings/domains")]
 fn get_eq_domains(headers: Headers) -> Json<Value> {
-    _get_eq_domains(headers, false)
+    _get_eq_domains(&headers, false)
 }
 
-fn _get_eq_domains(headers: Headers, no_excluded: bool) -> Json<Value> {
-    let user = headers.user;
+fn _get_eq_domains(headers: &Headers, no_excluded: bool) -> Json<Value> {
+    let user = &headers.user;
     use serde_json::from_str;
 
     let equivalent_domains: Vec<Vec<String>> = from_str(&user.equivalent_domains).unwrap();
@@ -105,12 +109,7 @@ struct EquivDomainData {
 }
 
 #[post("/settings/domains", data = "<data>")]
-async fn post_eq_domains(
-    data: Json<EquivDomainData>,
-    headers: Headers,
-    mut conn: DbConn,
-    nt: Notify<'_>,
-) -> JsonResult {
+async fn post_eq_domains(data: Json<EquivDomainData>, headers: Headers, conn: DbConn, nt: Notify<'_>) -> JsonResult {
     let data: EquivDomainData = data.into_inner();
 
     let excluded_globals = data.excluded_global_equivalent_domains.unwrap_or_default();
@@ -122,9 +121,9 @@ async fn post_eq_domains(
     user.excluded_globals = to_string(&excluded_globals).unwrap_or_else(|_| "[]".to_string());
     user.equivalent_domains = to_string(&equivalent_domains).unwrap_or_else(|_| "[]".to_string());
 
-    user.save(&mut conn).await?;
+    user.save(&conn).await?;
 
-    nt.send_user_update(UpdateType::SyncSettings, &user).await;
+    nt.send_user_update(UpdateType::SyncSettings, &user, &headers.device.push_uuid, &conn).await;
 
     Ok(Json(json!({})))
 }
@@ -199,11 +198,18 @@ fn get_api_webauthn(_headers: Headers) -> Json<Value> {
 #[get("/config")]
 fn config() -> Json<Value> {
     let domain = crate::CONFIG.domain();
+    // Official available feature flags can be found here:
+    // Server (v2025.6.2): https://github.com/bitwarden/server/blob/d094be3267f2030bd0dc62106bc6871cf82682f5/src/Core/Constants.cs#L103
+    // Client (web-v2025.6.1): https://github.com/bitwarden/clients/blob/747c2fd6a1c348a57a76e4a7de8128466ffd3c01/libs/common/src/enums/feature-flag.enum.ts#L12
+    // Android (v2025.6.0): https://github.com/bitwarden/android/blob/b5b022caaad33390c31b3021b2c1205925b0e1a2/app/src/main/kotlin/com/x8bit/bitwarden/data/platform/manager/model/FlagKey.kt#L22
+    // iOS (v2025.6.0): https://github.com/bitwarden/ios/blob/ff06d9c6cc8da89f78f37f376495800201d7261a/BitwardenShared/Core/Platform/Models/Enum/FeatureFlag.swift#L7
     let mut feature_states =
         parse_experimental_client_feature_flags(&crate::CONFIG.experimental_client_feature_flags());
-    // Force the new key rotation feature
-    feature_states.insert("key-rotation-improvements".to_string(), true);
-    feature_states.insert("flexible-collections-v-1".to_string(), false);
+    feature_states.insert("duo-redirect".to_string(), true);
+    feature_states.insert("email-verification".to_string(), true);
+    feature_states.insert("unauth-ui-refresh".to_string(), true);
+    feature_states.insert("enable-pm-flight-recorder".to_string(), true);
+    feature_states.insert("mobile-error-reporting".to_string(), true);
 
     Json(json!({
         // Note: The clients use this version to handle backwards compatibility concerns
@@ -211,14 +217,15 @@ fn config() -> Json<Value> {
         // We should make sure that we keep this updated when we support the new server features
         // Version history:
         // - Individual cipher key encryption: 2024.2.0
-        "version": "2025.1.0",
+        // - Mobile app support for MasterPasswordUnlockData: 2025.8.0
+        "version": "2025.12.0",
         "gitHash": option_env!("GIT_REV"),
         "server": {
           "name": "Vaultwarden",
           "url": "https://github.com/dani-garcia/vaultwarden"
         },
         "settings": {
-            "disableUserRegistration": !crate::CONFIG.signups_allowed() && crate::CONFIG.signups_domains_whitelist().is_empty(),
+            "disableUserRegistration": crate::CONFIG.is_signup_disabled()
         },
         "environment": {
           "vault": domain,
@@ -226,6 +233,12 @@ fn config() -> Json<Value> {
           "identity": format!("{domain}/identity"),
           "notifications": format!("{domain}/notifications"),
           "sso": "",
+          "cloudRegion": null,
+        },
+        // Bitwarden uses this for the self-hosted servers to indicate the default push technology
+        "push": {
+          "pushTechnology": 0,
+          "vapidPublicKey": null
         },
         "featureStates": feature_states,
         "object": "config",
@@ -245,4 +258,35 @@ fn api_not_found() -> Json<Value> {
             "description": "The requested resource could not be found."
         }
     }))
+}
+
+async fn accept_org_invite(
+    user: &User,
+    mut member: Membership,
+    reset_password_key: Option<String>,
+    conn: &DbConn,
+) -> EmptyResult {
+    if member.status != MembershipStatus::Invited as i32 {
+        err!("User already accepted the invitation");
+    }
+
+    member.status = MembershipStatus::Accepted as i32;
+    member.reset_password_key = reset_password_key;
+
+    // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member, admin::update_membership_type
+    OrgPolicy::check_user_allowed(&member, "join", conn).await?;
+
+    member.save(conn).await?;
+
+    if crate::CONFIG.mail_enabled() {
+        let org = match Organization::find_by_uuid(&member.org_uuid, conn).await {
+            Some(org) => org,
+            None => err!("Organization not found."),
+        };
+        // User was invited to an organization, so they must be confirmed manually after acceptance
+        mail::send_invite_accepted(&user.email, &member.invited_by_email.unwrap_or(org.billing_email), &org.name)
+            .await?;
+    }
+
+    Ok(())
 }

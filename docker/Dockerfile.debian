@@ -19,24 +19,24 @@
 # - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull docker.io/vaultwarden/web-vault:v2025.1.1
-#     $ docker image inspect --format "{{.RepoDigests}}" docker.io/vaultwarden/web-vault:v2025.1.1
-#     [docker.io/vaultwarden/web-vault@sha256:cb6b2095a4afc1d9d243a33f6d09211f40e3d82c7ae829fd025df5ff175a4918]
+#     $ docker pull docker.io/vaultwarden/web-vault:v2026.1.1
+#     $ docker image inspect --format "{{.RepoDigests}}" docker.io/vaultwarden/web-vault:v2026.1.1
+#     [docker.io/vaultwarden/web-vault@sha256:062fcf0d5dc37247dae61b0ee1ba5d20f9296e290d7ad1f6114ea5888f5738a7]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{.RepoTags}}" docker.io/vaultwarden/web-vault@sha256:cb6b2095a4afc1d9d243a33f6d09211f40e3d82c7ae829fd025df5ff175a4918
-#     [docker.io/vaultwarden/web-vault:v2025.1.1]
+#     $ docker image inspect --format "{{.RepoTags}}" docker.io/vaultwarden/web-vault@sha256:062fcf0d5dc37247dae61b0ee1ba5d20f9296e290d7ad1f6114ea5888f5738a7
+#     [docker.io/vaultwarden/web-vault:v2026.1.1]
 #
-FROM --platform=linux/amd64 docker.io/vaultwarden/web-vault@sha256:cb6b2095a4afc1d9d243a33f6d09211f40e3d82c7ae829fd025df5ff175a4918 AS vault
+FROM --platform=linux/amd64 docker.io/vaultwarden/web-vault@sha256:062fcf0d5dc37247dae61b0ee1ba5d20f9296e290d7ad1f6114ea5888f5738a7 AS vault
 
 ########################## Cross Compile Docker Helper Scripts ##########################
 ## We use the linux/amd64 no matter which Build Platform, since these are all bash scripts
 ## And these bash scripts do not have any significant difference if at all
-FROM --platform=linux/amd64 docker.io/tonistiigi/xx@sha256:9c207bead753dda9430bdd15425c6518fc7a03d866103c516a2c6889188f5894 AS xx
+FROM --platform=linux/amd64 docker.io/tonistiigi/xx@sha256:c64defb9ed5a91eacb37f96ccc3d4cd72521c4bd18d5442905b95e2226b0e707 AS xx
 
 ########################## BUILD IMAGE ##########################
 # hadolint ignore=DL3006
-FROM --platform=linux/amd64 docker.io/library/rust:1.84.1-slim-bookworm AS build
+FROM --platform=linux/amd64 docker.io/library/rust:1.93.1-slim-trixie AS build
 COPY --from=xx / /
 ARG TARGETARCH
 ARG TARGETVARIANT
@@ -51,7 +51,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TERM=xterm-256color \
     CARGO_HOME="/root/.cargo" \
     USER="root"
-
 # Install clang to get `xx-cargo` working
 # Install pkg-config to allow amd64 builds to find all libraries
 # Install git so build.rs can determine the correct version
@@ -68,15 +67,11 @@ RUN apt-get update && \
     xx-apt-get install -y \
         --no-install-recommends \
         gcc \
-        libmariadb3 \
         libpq-dev \
         libpq5 \
         libssl-dev \
+        libmariadb-dev \
         zlib1g-dev && \
-    # Force install arch dependend mariadb dev packages
-    # Installing them the normal way breaks several other packages (again)
-    apt-get download "libmariadb-dev-compat:$(xx-info debian-arch)" "libmariadb-dev:$(xx-info debian-arch)" && \
-    dpkg --force-all -i ./libmariadb-dev*.deb && \
     # Run xx-cargo early, since it sometimes seems to break when run at a later stage
     echo "export CARGO_TARGET=$(xx-cargo --print-target-triple)" >> /env-cargo
 
@@ -89,24 +84,24 @@ RUN USER=root cargo new --bin /app
 WORKDIR /app
 
 # Environment variables for Cargo on Debian based builds
-ARG ARCH_OPENSSL_LIB_DIR \
-    ARCH_OPENSSL_INCLUDE_DIR
+ARG TARGET_PKG_CONFIG_PATH
 
 RUN source /env-cargo && \
     if xx-info is-cross ; then \
-        # Some special variables if needed to override some build paths
-        if [[ -n "${ARCH_OPENSSL_LIB_DIR}" && -n "${ARCH_OPENSSL_INCLUDE_DIR}" ]]; then \
-            echo "export $(echo "${CARGO_TARGET}" | tr '[:lower:]' '[:upper:]' | tr - _)_OPENSSL_LIB_DIR=${ARCH_OPENSSL_LIB_DIR}" >> /env-cargo && \
-            echo "export $(echo "${CARGO_TARGET}" | tr '[:lower:]' '[:upper:]' | tr - _)_OPENSSL_INCLUDE_DIR=${ARCH_OPENSSL_INCLUDE_DIR}" >> /env-cargo ; \
-        fi && \
         # We can't use xx-cargo since that uses clang, which doesn't work for our libraries.
         # Because of this we generate the needed environment variables here which we can load in the needed steps.
         echo "export CC_$(echo "${CARGO_TARGET}" | tr '[:upper:]' '[:lower:]' | tr - _)=/usr/bin/$(xx-info)-gcc" >> /env-cargo && \
         echo "export CARGO_TARGET_$(echo "${CARGO_TARGET}" | tr '[:lower:]' '[:upper:]' | tr - _)_LINKER=/usr/bin/$(xx-info)-gcc" >> /env-cargo && \
-        echo "export PKG_CONFIG=/usr/bin/$(xx-info)-pkg-config" >> /env-cargo && \
         echo "export CROSS_COMPILE=1" >> /env-cargo && \
-        echo "export OPENSSL_INCLUDE_DIR=/usr/include/$(xx-info)" >> /env-cargo && \
-        echo "export OPENSSL_LIB_DIR=/usr/lib/$(xx-info)" >> /env-cargo ; \
+        echo "export PKG_CONFIG_ALLOW_CROSS=1" >> /env-cargo && \
+        # For some architectures `xx-info` returns a triple which doesn't matches the path on disk
+        # In those cases you can override this by setting the `TARGET_PKG_CONFIG_PATH` build-arg
+        if [[ -n "${TARGET_PKG_CONFIG_PATH}" ]]; then \
+            echo "export TARGET_PKG_CONFIG_PATH=${TARGET_PKG_CONFIG_PATH}" >> /env-cargo ; \
+        else \
+            echo "export PKG_CONFIG_PATH=/usr/lib/$(xx-info)/pkgconfig" >> /env-cargo ; \
+        fi && \
+        echo "# End of env-cargo" >> /env-cargo ; \
     fi && \
     # Output the current contents of the file
     cat /env-cargo
@@ -166,7 +161,7 @@ RUN source /env-cargo && \
 # To uninstall: docker run --privileged --rm tonistiigi/binfmt --uninstall 'qemu-*'
 #
 # We need to add `--platform` here, because of a podman bug: https://github.com/containers/buildah/issues/4742
-FROM --platform=linux/amd64 docker.io/library/debian:bookworm-slim
+FROM --platform=linux/amd64 docker.io/library/debian:trixie-slim
 
 ENV ROCKET_PROFILE="release" \
     ROCKET_ADDRESS=0.0.0.0 \
@@ -179,7 +174,7 @@ RUN mkdir /data && \
         --no-install-recommends \
         ca-certificates \
         curl \
-        libmariadb-dev-compat \
+        libmariadb3 \
         libpq5 \
         openssl && \
     apt-get clean && \

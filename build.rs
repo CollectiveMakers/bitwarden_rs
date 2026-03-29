@@ -9,8 +9,8 @@ fn main() {
     println!("cargo:rustc-cfg=mysql");
     #[cfg(feature = "postgresql")]
     println!("cargo:rustc-cfg=postgresql");
-    #[cfg(feature = "query_logger")]
-    println!("cargo:rustc-cfg=query_logger");
+    #[cfg(feature = "s3")]
+    println!("cargo:rustc-cfg=s3");
 
     #[cfg(not(any(feature = "sqlite", feature = "mysql", feature = "postgresql")))]
     compile_error!(
@@ -22,7 +22,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(sqlite)");
     println!("cargo::rustc-check-cfg=cfg(mysql)");
     println!("cargo::rustc-check-cfg=cfg(postgresql)");
-    println!("cargo::rustc-check-cfg=cfg(query_logger)");
+    println!("cargo::rustc-check-cfg=cfg(s3)");
 
     // Rerun when these paths are changed.
     // Someone could have checked-out a tag or specific commit, but no other files changed.
@@ -30,9 +30,6 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-changed=.git/refs/tags");
-
-    #[cfg(all(not(debug_assertions), feature = "query_logger"))]
-    compile_error!("Query Logging is only allowed during development, it is not intended for production usage!");
 
     // Support $BWRS_VERSION for legacy compatibility, but default to $VW_VERSION.
     // If neither exist, read from git.
@@ -48,8 +45,8 @@ fn main() {
 fn run(args: &[&str]) -> Result<String, std::io::Error> {
     let out = Command::new(args[0]).args(&args[1..]).output()?;
     if !out.status.success() {
-        use std::io::{Error, ErrorKind};
-        return Err(Error::new(ErrorKind::Other, "Command not successful"));
+        use std::io::Error;
+        return Err(Error::other("Command not successful"));
     }
     Ok(String::from_utf8(out.stdout).unwrap().trim().to_string())
 }

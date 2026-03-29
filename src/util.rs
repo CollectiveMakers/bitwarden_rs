@@ -16,7 +16,7 @@ use tokio::{
     time::{sleep, Duration},
 };
 
-use crate::CONFIG;
+use crate::{config::PathType, CONFIG};
 
 pub struct AppHeaders();
 
@@ -56,60 +56,74 @@ impl Fairing for AppHeaders {
         res.set_raw_header("X-Content-Type-Options", "nosniff");
         res.set_raw_header("X-Robots-Tag", "noindex, nofollow");
 
-        if !res.headers().get_one("Content-Type").is_some_and(|v| v.starts_with("image/")) {
-            res.set_raw_header("Cross-Origin-Resource-Policy", "same-origin");
-        }
-
         // Obsolete in modern browsers, unsafe (XS-Leak), and largely replaced by CSP
         res.set_raw_header("X-XSS-Protection", "0");
+
+        // The `Cross-Origin-Resource-Policy` header should not be set on images or on the `icon_external` route.
+        // Otherwise some clients, like the Bitwarden Desktop, will fail to download the icons
+        let mut is_image = true;
+        if !(res.headers().get_one("Content-Type").is_some_and(|v| v.starts_with("image/"))
+            || req.route().is_some_and(|v| v.name.as_deref() == Some("icon_external")))
+        {
+            is_image = false;
+            res.set_raw_header("Cross-Origin-Resource-Policy", "same-origin");
+        }
 
         // Do not send the Content-Security-Policy (CSP) Header and X-Frame-Options for the *-connector.html files.
         // This can cause issues when some MFA requests needs to open a popup or page within the clients like WebAuthn, or Duo.
         // This is the same behavior as upstream Bitwarden.
         if !req_uri_path.ends_with("connector.html") {
-            // # Frame Ancestors:
-            // Chrome Web Store: https://chrome.google.com/webstore/detail/bitwarden-free-password-m/nngceckbapebfimnlniiiahkandclblb
-            // Edge Add-ons: https://microsoftedge.microsoft.com/addons/detail/bitwarden-free-password/jbkfoedolllekgbhcbcoahefnbanhhlh?hl=en-US
-            // Firefox Browser Add-ons: https://addons.mozilla.org/en-US/firefox/addon/bitwarden-password-manager/
-            // # img/child/frame src:
-            // Have I Been Pwned to allow those calls to work.
-            // # Connect src:
-            // Leaked Passwords check: api.pwnedpasswords.com
-            // 2FA/MFA Site check: api.2fa.directory
-            // # Mail Relay: https://bitwarden.com/blog/add-privacy-and-security-using-email-aliases-with-bitwarden/
-            // app.simplelogin.io, app.addy.io, api.fastmail.com, quack.duckduckgo.com
-            let csp = format!(
-                "default-src 'none'; \
-                font-src 'self'; \
-                manifest-src 'self'; \
-                base-uri 'self'; \
-                form-action 'self'; \
-                object-src 'self' blob:; \
-                script-src 'self' 'wasm-unsafe-eval'; \
-                style-src 'self' 'unsafe-inline'; \
-                child-src 'self' https://*.duosecurity.com https://*.duofederal.com; \
-                frame-src 'self' https://*.duosecurity.com https://*.duofederal.com; \
-                frame-ancestors 'self' \
-                  chrome-extension://nngceckbapebfimnlniiiahkandclblb \
-                  chrome-extension://jbkfoedolllekgbhcbcoahefnbanhhlh \
-                  moz-extension://* \
-                  {allowed_iframe_ancestors}; \
-                img-src 'self' data: \
-                  https://haveibeenpwned.com \
-                  {icon_service_csp}; \
-                connect-src 'self' \
-                  https://api.pwnedpasswords.com \
-                  https://api.2fa.directory \
-                  https://app.simplelogin.io/api/ \
-                  https://app.addy.io/api/ \
-                  https://api.fastmail.com/ \
-                  https://api.forwardemail.net \
-                  {allowed_connect_src};\
-                ",
-                icon_service_csp = CONFIG._icon_service_csp(),
-                allowed_iframe_ancestors = CONFIG.allowed_iframe_ancestors(),
-                allowed_connect_src = CONFIG.allowed_connect_src(),
-            );
+            let csp = if is_image {
+                // Prevent scripts, frames, objects, etc., from loading with images, mainly for SVG images, since these could contain JavaScript and other unsafe items.
+                // Even though we sanitize SVG images before storing and viewing them, it's better to prevent allowing these elements.
+                String::from("default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'none'; frame-src 'none'; object-src 'none")
+            } else {
+                // # Frame Ancestors:
+                // Chrome Web Store: https://chrome.google.com/webstore/detail/bitwarden-free-password-m/nngceckbapebfimnlniiiahkandclblb
+                // Edge Add-ons: https://microsoftedge.microsoft.com/addons/detail/bitwarden-free-password/jbkfoedolllekgbhcbcoahefnbanhhlh?hl=en-US
+                // Firefox Browser Add-ons: https://addons.mozilla.org/en-US/firefox/addon/bitwarden-password-manager/
+                // # img/child/frame src:
+                // Have I Been Pwned to allow those calls to work.
+                // # Connect src:
+                // Leaked Passwords check: api.pwnedpasswords.com
+                // 2FA/MFA Site check: api.2fa.directory
+                // # Mail Relay: https://bitwarden.com/blog/add-privacy-and-security-using-email-aliases-with-bitwarden/
+                // app.simplelogin.io, app.addy.io, api.fastmail.com, api.forwardemail.net
+                format!(
+                    "default-src 'none'; \
+                    font-src 'self'; \
+                    manifest-src 'self'; \
+                    base-uri 'self'; \
+                    form-action 'self'; \
+                    media-src 'self'; \
+                    object-src 'self' blob:; \
+                    script-src 'self' 'wasm-unsafe-eval'; \
+                    style-src 'self' 'unsafe-inline'; \
+                    child-src 'self' https://*.duosecurity.com https://*.duofederal.com; \
+                    frame-src 'self' https://*.duosecurity.com https://*.duofederal.com; \
+                    frame-ancestors 'self' \
+                    chrome-extension://nngceckbapebfimnlniiiahkandclblb \
+                    chrome-extension://jbkfoedolllekgbhcbcoahefnbanhhlh \
+                    moz-extension://* \
+                    {allowed_iframe_ancestors}; \
+                    img-src 'self' data: \
+                    https://haveibeenpwned.com \
+                    {icon_service_csp}; \
+                    connect-src 'self' \
+                    https://api.pwnedpasswords.com \
+                    https://api.2fa.directory \
+                    https://app.simplelogin.io/api/ \
+                    https://app.addy.io/api/ \
+                    https://api.fastmail.com/ \
+                    https://api.forwardemail.net \
+                    {allowed_connect_src};\
+                    ",
+                    icon_service_csp = CONFIG._icon_service_csp(),
+                    allowed_iframe_ancestors = CONFIG.allowed_iframe_ancestors(),
+                    allowed_connect_src = CONFIG.allowed_connect_src(),
+                )
+            };
+
             res.set_raw_header("Content-Security-Policy", csp);
             res.set_raw_header("X-Frame-Options", "SAMEORIGIN");
         } else {
@@ -138,9 +152,12 @@ impl Cors {
     // If a match exists, return it. Otherwise, return None.
     fn get_allowed_origin(headers: &HeaderMap<'_>) -> Option<String> {
         let origin = Cors::get_header(headers, "Origin");
-        let domain_origin = CONFIG.domain_origin();
         let safari_extension_origin = "file://";
-        if origin == domain_origin || origin == safari_extension_origin {
+
+        if origin == CONFIG.domain_origin()
+            || origin == safari_extension_origin
+            || (CONFIG.sso_enabled() && origin == CONFIG.sso_authority())
+        {
             Some(origin)
         } else {
             None
@@ -264,8 +281,8 @@ impl Fairing for BetterLogging {
         } else {
             "http"
         };
-        let addr = format!("{}://{}:{}", &scheme, &config.address, &config.port);
-        info!(target: "start", "Rocket has launched from {}", addr);
+        let addr = format!("{scheme}://{}:{}", &config.address, &config.port);
+        info!(target: "start", "Rocket has launched from {addr}");
     }
 
     async fn on_request(&self, request: &mut Request<'_>, _data: &mut Data<'_>) {
@@ -279,8 +296,8 @@ impl Fairing for BetterLogging {
         let uri_subpath = uri_path_str.strip_prefix(&CONFIG.domain_path()).unwrap_or(&uri_path_str);
         if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
             match uri.query() {
-                Some(q) => info!(target: "request", "{} {}?{}", method, uri_path_str, &q[..q.len().min(30)]),
-                None => info!(target: "request", "{} {}", method, uri_path_str),
+                Some(q) => info!(target: "request", "{method} {uri_path_str}?{}", &q[..q.len().min(30)]),
+                None => info!(target: "request", "{method} {uri_path_str}"),
             };
         }
     }
@@ -295,9 +312,9 @@ impl Fairing for BetterLogging {
         if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
             let status = response.status();
             if let Some(ref route) = request.route() {
-                info!(target: "response", "{} => {}", route, status)
+                info!(target: "response", "{route} => {status}")
             } else {
-                info!(target: "response", "{}", status)
+                info!(target: "response", "{status}")
             }
         }
     }
@@ -322,7 +339,7 @@ pub fn get_display_size(size: i64) -> String {
         }
     }
 
-    format!("{:.2} {}", size, UNITS[unit_counter])
+    format!("{size:.2} {}", UNITS[unit_counter])
 }
 
 pub fn get_uuid() -> String {
@@ -514,7 +531,7 @@ struct WebVaultVersion {
     version: String,
 }
 
-pub fn get_web_vault_version() -> String {
+pub fn get_active_web_release() -> String {
     let version_files = [
         format!("{}/vw-version.json", CONFIG.web_vault_folder()),
         format!("{}/version.json", CONFIG.web_vault_folder()),
@@ -695,7 +712,7 @@ where
                     return Err(e);
                 }
 
-                warn!("Can't connect to database, retrying: {:?}", e);
+                warn!("Can't connect to database, retrying: {e:?}");
 
                 sleep(Duration::from_millis(1_000)).await;
             }
@@ -748,9 +765,20 @@ pub fn convert_json_key_lcase_first(src_json: Value) -> Value {
 
 /// Parses the experimental client feature flags string into a HashMap.
 pub fn parse_experimental_client_feature_flags(experimental_client_feature_flags: &str) -> HashMap<String, bool> {
-    let feature_states = experimental_client_feature_flags.split(',').map(|f| (f.trim().to_owned(), true)).collect();
-
-    feature_states
+    // These flags could still be configured, but are deprecated and not used anymore
+    // To prevent old installations from starting filter these out and not error out
+    const DEPRECATED_FLAGS: &[&str] =
+        &["autofill-overlay", "autofill-v2", "browser-fileless-import", "extension-refresh", "fido2-vault-credentials"];
+    experimental_client_feature_flags
+        .split(',')
+        .filter_map(|f| {
+            let flag = f.trim();
+            if !flag.is_empty() && !DEPRECATED_FLAGS.contains(&flag) {
+                return Some((flag.to_owned(), true));
+            }
+            None
+        })
+        .collect()
 }
 
 /// TODO: This is extracted from IpAddr::is_global, which is unstable:
@@ -810,6 +838,26 @@ pub use is_global_hardcoded as is_global;
 #[inline(always)]
 pub fn is_global(ip: std::net::IpAddr) -> bool {
     ip.is_global()
+}
+
+/// Saves a Rocket temporary file to the OpenDAL Operator at the given path.
+pub async fn save_temp_file(
+    path_type: &PathType,
+    path: &str,
+    temp_file: rocket::fs::TempFile<'_>,
+    overwrite: bool,
+) -> Result<(), crate::Error> {
+    use futures::AsyncWriteExt as _;
+    use tokio_util::compat::TokioAsyncReadCompatExt as _;
+
+    let operator = CONFIG.opendal_operator_for_path_type(path_type)?;
+
+    let mut read_stream = temp_file.open().await?.compat();
+    let mut writer = operator.writer_with(path).if_not_exists(!overwrite).await?.into_futures_async_write();
+    futures::io::copy(&mut read_stream, &mut writer).await?;
+    writer.close().await?;
+
+    Ok(())
 }
 
 /// These are some tests to check that the implementations match

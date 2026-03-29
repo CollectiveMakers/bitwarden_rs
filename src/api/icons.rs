@@ -1,27 +1,23 @@
 use std::{
     collections::HashMap,
     net::IpAddr,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, SystemTime},
 };
 
 use bytes::{Bytes, BytesMut};
 use futures::{stream::StreamExt, TryFutureExt};
-use once_cell::sync::Lazy;
+use html5gum::{Emitter, HtmlString, Readable, StringReader, Tokenizer};
 use regex::Regex;
 use reqwest::{
     header::{self, HeaderMap, HeaderValue},
     Client, Response,
 };
 use rocket::{http::ContentType, response::Redirect, Route};
-use tokio::{
-    fs::{create_dir_all, remove_file, symlink_metadata, File},
-    io::{AsyncReadExt, AsyncWriteExt},
-};
-
-use html5gum::{Emitter, HtmlString, Readable, StringReader, Tokenizer};
+use svg_hush::{data_url_filter, Filter};
 
 use crate::{
+    config::PathType,
     error::Error,
     http_client::{get_reqwest_client_builder, should_block_address, CustomHttpClientError},
     util::Cached,
@@ -35,14 +31,32 @@ pub fn routes() -> Vec<Route> {
     }
 }
 
-static CLIENT: Lazy<Client> = Lazy::new(|| {
+static CLIENT: LazyLock<Client> = LazyLock::new(|| {
     // Generate the default headers
     let mut default_headers = HeaderMap::new();
-    default_headers.insert(header::USER_AGENT, HeaderValue::from_static("Links (2.22; Linux X86_64; GNU C; text)"));
-    default_headers.insert(header::ACCEPT, HeaderValue::from_static("text/html, text/*;q=0.5, image/*, */*;q=0.1"));
-    default_headers.insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en,*;q=0.1"));
+    default_headers.insert(
+        header::USER_AGENT,
+        HeaderValue::from_static(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+        ),
+    );
+    default_headers.insert(header::ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"));
+    default_headers.insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
     default_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     default_headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    default_headers.insert(header::UPGRADE_INSECURE_REQUESTS, HeaderValue::from_static("1"));
+
+    default_headers.insert("Sec-Ch-Ua-Mobile", HeaderValue::from_static("?0"));
+    default_headers.insert("Sec-Ch-Ua-Platform", HeaderValue::from_static("Linux"));
+    default_headers.insert(
+        "Sec-Ch-Ua",
+        HeaderValue::from_static("\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\""),
+    );
+
+    default_headers.insert("Sec-Fetch-Site", HeaderValue::from_static("none"));
+    default_headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("navigate"));
+    default_headers.insert("Sec-Fetch-User", HeaderValue::from_static("?1"));
+    default_headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("document"));
 
     // Generate the cookie store
     let cookie_store = Arc::new(Jar::default());
@@ -56,27 +70,31 @@ static CLIENT: Lazy<Client> = Lazy::new(|| {
         .pool_max_idle_per_host(5) // Configure the Hyper Pool to only have max 5 idle connections
         .pool_idle_timeout(pool_idle_timeout) // Configure the Hyper Pool to timeout after 10 seconds
         .default_headers(default_headers.clone())
+        .http1_title_case_headers()
         .build()
         .expect("Failed to build client")
 });
 
 // Build Regex only once since this takes a lot of time.
-static ICON_SIZE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?x)(\d+)\D*(\d+)").unwrap());
+static ICON_SIZE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?x)(\d+)\D*(\d+)").unwrap());
 
+// The function name `icon_external` is checked in the `on_response` function in `AppHeaders`
+// It is used to prevent sending a specific header which breaks icon downloads.
+// If this function needs to be renamed, also adjust the code in `util.rs`
 #[get("/<domain>/icon.png")]
-fn icon_external(domain: &str) -> Option<Redirect> {
+fn icon_external(domain: &str) -> Cached<Option<Redirect>> {
     if !is_valid_domain(domain) {
-        warn!("Invalid domain: {}", domain);
-        return None;
+        warn!("Invalid domain: {domain}");
+        return Cached::ttl(None, CONFIG.icon_cache_negttl(), true);
     }
 
     if should_block_address(domain) {
-        warn!("Blocked address: {}", domain);
-        return None;
+        warn!("Blocked address: {domain}");
+        return Cached::ttl(None, CONFIG.icon_cache_negttl(), true);
     }
 
     let url = CONFIG._icon_service_url().replace("{}", domain);
-    match CONFIG.icon_redirect_code() {
+    let redir = match CONFIG.icon_redirect_code() {
         301 => Some(Redirect::moved(url)), // legacy permanent redirect
         302 => Some(Redirect::found(url)), // legacy temporary redirect
         307 => Some(Redirect::temporary(url)),
@@ -85,7 +103,8 @@ fn icon_external(domain: &str) -> Option<Redirect> {
             error!("Unexpected redirect code {}", CONFIG.icon_redirect_code());
             None
         }
-    }
+    };
+    Cached::ttl(redir, CONFIG.icon_cache_ttl(), true)
 }
 
 #[get("/<domain>/icon.png")]
@@ -93,7 +112,7 @@ async fn icon_internal(domain: &str) -> Cached<(ContentType, Vec<u8>)> {
     const FALLBACK_ICON: &[u8] = include_bytes!("../static/images/fallback-icon.png");
 
     if !is_valid_domain(domain) {
-        warn!("Invalid domain: {}", domain);
+        warn!("Invalid domain: {domain}");
         return Cached::ttl(
             (ContentType::new("image", "png"), FALLBACK_ICON.to_vec()),
             CONFIG.icon_cache_negttl(),
@@ -102,7 +121,7 @@ async fn icon_internal(domain: &str) -> Cached<(ContentType, Vec<u8>)> {
     }
 
     if should_block_address(domain) {
-        warn!("Blocked address: {}", domain);
+        warn!("Blocked address: {domain}");
         return Cached::ttl(
             (ContentType::new("image", "png"), FALLBACK_ICON.to_vec()),
             CONFIG.icon_cache_negttl(),
@@ -123,11 +142,11 @@ async fn icon_internal(domain: &str) -> Cached<(ContentType, Vec<u8>)> {
 /// This does some manual checks and makes use of Url to do some basic checking.
 /// domains can't be larger then 63 characters (not counting multiple subdomains) according to the RFC's, but we limit the total size to 255.
 fn is_valid_domain(domain: &str) -> bool {
-    const ALLOWED_CHARS: &str = "_-.";
+    const ALLOWED_CHARS: &str = "-.";
 
     // If parsing the domain fails using Url, it will not work with reqwest.
     if let Err(parse_error) = url::Url::parse(format!("https://{domain}").as_str()) {
-        debug!("Domain parse error: '{}' - {:?}", domain, parse_error);
+        debug!("Domain parse error: '{domain}' - {parse_error:?}");
         return false;
     } else if domain.is_empty()
         || domain.contains("..")
@@ -136,18 +155,17 @@ fn is_valid_domain(domain: &str) -> bool {
         || domain.ends_with('-')
     {
         debug!(
-            "Domain validation error: '{}' is either empty, contains '..', starts with an '.', starts or ends with a '-'",
-            domain
+            "Domain validation error: '{domain}' is either empty, contains '..', starts with an '.', starts or ends with a '-'"
         );
         return false;
     } else if domain.len() > 255 {
-        debug!("Domain validation error: '{}' exceeds 255 characters", domain);
+        debug!("Domain validation error: '{domain}' exceeds 255 characters");
         return false;
     }
 
     for c in domain.chars() {
         if !c.is_alphanumeric() && !ALLOWED_CHARS.contains(c) {
-            debug!("Domain validation error: '{}' contains an invalid character '{}'", domain, c);
+            debug!("Domain validation error: '{domain}' contains an invalid character '{c}'");
             return false;
         }
     }
@@ -156,7 +174,7 @@ fn is_valid_domain(domain: &str) -> bool {
 }
 
 async fn get_icon(domain: &str) -> Option<(Vec<u8>, String)> {
-    let path = format!("{}/{}.png", CONFIG.icon_cache_folder(), domain);
+    let path = format!("{domain}.png");
 
     // Check for expiration of negatively cached copy
     if icon_is_negcached(&path).await {
@@ -164,10 +182,7 @@ async fn get_icon(domain: &str) -> Option<(Vec<u8>, String)> {
     }
 
     if let Some(icon) = get_cached_icon(&path).await {
-        let icon_type = match get_icon_type(&icon) {
-            Some(x) => x,
-            _ => "x-icon",
-        };
+        let icon_type = get_icon_type(&icon).unwrap_or("x-icon");
         return Some((icon, icon_type.to_string()));
     }
 
@@ -178,7 +193,7 @@ async fn get_icon(domain: &str) -> Option<(Vec<u8>, String)> {
     // Get the icon, or None in case of error
     match download_icon(domain).await {
         Ok((icon, icon_type)) => {
-            save_icon(&path, &icon).await;
+            save_icon(&path, icon.to_vec()).await;
             Some((icon.to_vec(), icon_type.unwrap_or("x-icon").to_string()))
         }
         Err(e) => {
@@ -189,9 +204,9 @@ async fn get_icon(domain: &str) -> Option<(Vec<u8>, String)> {
                 return None;
             }
 
-            warn!("Unable to download icon: {:?}", e);
+            warn!("Unable to download icon: {e:?}");
             let miss_indicator = path + ".miss";
-            save_icon(&miss_indicator, &[]).await;
+            save_icon(&miss_indicator, vec![]).await;
             None
         }
     }
@@ -204,11 +219,9 @@ async fn get_cached_icon(path: &str) -> Option<Vec<u8>> {
     }
 
     // Try to read the cached icon, and return it if it exists
-    if let Ok(mut f) = File::open(path).await {
-        let mut buffer = Vec::new();
-
-        if f.read_to_end(&mut buffer).await.is_ok() {
-            return Some(buffer);
+    if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::IconCache) {
+        if let Ok(buf) = operator.read(path).await {
+            return Some(buf.to_vec());
         }
     }
 
@@ -216,9 +229,11 @@ async fn get_cached_icon(path: &str) -> Option<Vec<u8>> {
 }
 
 async fn file_is_expired(path: &str, ttl: u64) -> Result<bool, Error> {
-    let meta = symlink_metadata(path).await?;
-    let modified = meta.modified()?;
-    let age = SystemTime::now().duration_since(modified)?;
+    let operator = CONFIG.opendal_operator_for_path_type(&PathType::IconCache)?;
+    let meta = operator.stat(path).await?;
+    let modified =
+        meta.last_modified().ok_or_else(|| std::io::Error::other(format!("No last modified time for `{path}`")))?;
+    let age = SystemTime::now().duration_since(modified.into())?;
 
     Ok(ttl > 0 && ttl <= age.as_secs())
 }
@@ -230,8 +245,13 @@ async fn icon_is_negcached(path: &str) -> bool {
     match expired {
         // No longer negatively cached, drop the marker
         Ok(true) => {
-            if let Err(e) = remove_file(&miss_indicator).await {
-                error!("Could not remove negative cache indicator for icon {:?}: {:?}", path, e);
+            match CONFIG.opendal_operator_for_path_type(&PathType::IconCache) {
+                Ok(operator) => {
+                    if let Err(e) = operator.delete(&miss_indicator).await {
+                        error!("Could not remove negative cache indicator for icon {path:?}: {e:?}");
+                    }
+                }
+                Err(e) => error!("Could not remove negative cache indicator for icon {path:?}: {e:?}"),
             }
             false
         }
@@ -317,7 +337,7 @@ struct IconUrlResult {
 
 /// Returns a IconUrlResult which holds a Vector IconList and a string which holds the referer.
 /// There will always two items within the iconlist which holds http(s)://domain.tld/favicon.ico.
-/// This does not mean that that location does exists, but it is the default location browser use.
+/// This does not mean that location exists, but (it) is the default location the browser uses.
 ///
 /// # Argument
 /// * `domain` - A string which holds the domain with extension.
@@ -441,8 +461,8 @@ async fn get_page_with_referer(url: &str, referer: &str) -> Result<Response, Err
 /// priority2 = get_icon_priority("https://example.com/path/to/a/favicon.ico", "");
 /// ```
 fn get_icon_priority(href: &str, sizes: &str) -> u8 {
-    static PRIORITY_MAP: Lazy<HashMap<&'static str, u8>> =
-        Lazy::new(|| [(".png", 10), (".jpg", 20), (".jpeg", 20)].into_iter().collect());
+    static PRIORITY_MAP: LazyLock<HashMap<&'static str, u8>> =
+        LazyLock::new(|| [(".png", 10), (".jpg", 20), (".jpeg", 20)].into_iter().collect());
 
     // Check if there is a dimension set
     let (width, height) = parse_sizes(sizes);
@@ -531,10 +551,10 @@ async fn download_icon(domain: &str) -> Result<(Bytes, Option<&str>), Error> {
                         // Check if the icon type is allowed, else try an icon from the list.
                         icon_type = get_icon_type(&body);
                         if icon_type.is_none() {
-                            debug!("Icon from {} data:image uri, is not a valid image type", domain);
+                            debug!("Icon from {domain} data:image uri, is not a valid image type");
                             continue;
                         }
-                        info!("Extracted icon from data:image uri for {}", domain);
+                        info!("Extracted icon from data:image uri for {domain}");
                         buffer = body.freeze();
                         break;
                     }
@@ -560,26 +580,46 @@ async fn download_icon(domain: &str) -> Result<(Bytes, Option<&str>), Error> {
 
     if buffer.is_empty() {
         err_silent!("Empty response or unable find a valid icon", domain);
+    } else if icon_type == Some("svg+xml") {
+        let mut svg_filter = Filter::new();
+        svg_filter.set_data_url_filter(data_url_filter::allow_standard_images);
+        let mut sanitized_svg = Vec::new();
+        if svg_filter.filter(&*buffer, &mut sanitized_svg).is_err() {
+            icon_type = None;
+            buffer.clear();
+        } else {
+            buffer = sanitized_svg.into();
+        }
     }
 
     Ok((buffer, icon_type))
 }
 
-async fn save_icon(path: &str, icon: &[u8]) {
-    match File::create(path).await {
-        Ok(mut f) => {
-            f.write_all(icon).await.expect("Error writing icon file");
-        }
-        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
-            create_dir_all(&CONFIG.icon_cache_folder()).await.expect("Error creating icon cache folder");
-        }
+async fn save_icon(path: &str, icon: Vec<u8>) {
+    let operator = match CONFIG.opendal_operator_for_path_type(&PathType::IconCache) {
+        Ok(operator) => operator,
         Err(e) => {
-            warn!("Unable to save icon: {:?}", e);
+            warn!("Failed to get OpenDAL operator while saving icon: {e}");
+            return;
         }
+    };
+
+    if let Err(e) = operator.write(path, icon).await {
+        warn!("Unable to save icon: {e:?}");
     }
 }
 
 fn get_icon_type(bytes: &[u8]) -> Option<&'static str> {
+    fn check_svg_after_xml_declaration(bytes: &[u8]) -> Option<&'static str> {
+        // Look for SVG tag within the first 1KB
+        if let Ok(content) = std::str::from_utf8(&bytes[..bytes.len().min(1024)]) {
+            if content.contains("<svg") || content.contains("<SVG") {
+                return Some("svg+xml");
+            }
+        }
+        None
+    }
+
     match bytes {
         [137, 80, 78, 71, ..] => Some("png"),
         [0, 0, 1, 0, ..] => Some("x-icon"),
@@ -587,6 +627,8 @@ fn get_icon_type(bytes: &[u8]) -> Option<&'static str> {
         [255, 216, 255, ..] => Some("jpeg"),
         [71, 73, 70, 56, ..] => Some("gif"),
         [66, 77, ..] => Some("bmp"),
+        [60, 115, 118, 103, ..] => Some("svg+xml"), // Normal svg
+        [60, 63, 120, 109, 108, ..] => check_svg_after_xml_declaration(bytes), // An svg starting with <?xml
         _ => None,
     }
 }
@@ -598,6 +640,12 @@ async fn stream_to_bytes_limit(res: Response, max_size: usize) -> Result<Bytes, 
     let mut buf = BytesMut::new();
     let mut size = 0;
     while let Some(chunk) = stream.next().await {
+        // It is possible that there might occur UnexpectedEof errors or others
+        // This is most of the time no issue, and if there is no chunked data anymore or at all parsing the HTML will not happen anyway.
+        // Therefore if chunk is an err, just break and continue with the data be have received.
+        if chunk.is_err() {
+            break;
+        }
         let chunk = &chunk?;
         size += chunk.len();
         buf.extend(chunk);
@@ -749,8 +797,11 @@ impl Emitter for FaviconEmitter {
     fn emit_current_tag(&mut self) -> Option<html5gum::State> {
         self.flush_current_attribute(true);
         self.last_start_tag.clear();
-        if self.current_token.is_some() && !self.current_token.as_ref().unwrap().closing {
-            self.last_start_tag.extend(&*self.current_token.as_ref().unwrap().tag.name);
+        match &self.current_token {
+            Some(token) if !token.closing => {
+                self.last_start_tag.extend(&*token.tag.name);
+            }
+            _ => {}
         }
         html5gum::naive_next_state(&self.last_start_tag)
     }

@@ -21,7 +21,7 @@ use url::Url;
 
 // The location on this service that Duo should redirect users to. For us, this is a bridge
 // built in to the Bitwarden clients.
-// See: https://github.com/bitwarden/clients/blob/main/apps/web/src/connectors/duo-redirect.ts
+// See: https://github.com/bitwarden/clients/blob/5fb46df3415aefced0b52f2db86c873962255448/apps/web/src/connectors/duo-redirect.ts
 const DUO_REDIRECT_LOCATION: &str = "duo-redirect-connector.html";
 
 // Number of seconds that a JWT we generate for Duo should be valid for.
@@ -182,7 +182,7 @@ impl DuoClient {
             HealthCheckResponse::HealthFail {
                 message,
                 message_detail,
-            } => err!(format!("Duo health check FAIL response, msg: {}, detail: {}", message, message_detail)),
+            } => err!(format!("Duo health check FAIL response, msg: {message}, detail: {message_detail}")),
         };
 
         if health_stat != "OK" {
@@ -275,7 +275,7 @@ impl DuoClient {
 
         let status_code = res.status();
         if status_code != StatusCode::OK {
-            err!(format!("Failure response from Duo: {}", status_code))
+            err!(format!("Failure response from Duo: {status_code}"))
         }
 
         let response: IdTokenResponse = match res.json::<IdTokenResponse>().await {
@@ -317,7 +317,7 @@ struct DuoAuthContext {
 
 // Given a state string, retrieve the associated Duo auth context and
 // delete the retrieved state from the database.
-async fn extract_context(state: &str, conn: &mut DbConn) -> Option<DuoAuthContext> {
+async fn extract_context(state: &str, conn: &DbConn) -> Option<DuoAuthContext> {
     let ctx: TwoFactorDuoContext = match TwoFactorDuoContext::find_by_state(state, conn).await {
         Some(c) => c,
         None => return None,
@@ -344,8 +344,8 @@ async fn extract_context(state: &str, conn: &mut DbConn) -> Option<DuoAuthContex
 // Task to clean up expired Duo authentication contexts that may have accumulated in the database.
 pub async fn purge_duo_contexts(pool: DbPool) {
     debug!("Purging Duo authentication contexts");
-    if let Ok(mut conn) = pool.get().await {
-        TwoFactorDuoContext::purge_expired_duo_contexts(&mut conn).await;
+    if let Ok(conn) = pool.get().await {
+        TwoFactorDuoContext::purge_expired_duo_contexts(&conn).await;
     } else {
         error!("Failed to get DB connection while purging expired Duo authentications")
     }
@@ -380,7 +380,7 @@ pub async fn get_duo_auth_url(
     email: &str,
     client_id: &str,
     device_identifier: &DeviceId,
-    conn: &mut DbConn,
+    conn: &DbConn,
 ) -> Result<String, Error> {
     let (ik, sk, _, host) = get_duo_keys_email(email, conn).await?;
 
@@ -418,7 +418,7 @@ pub async fn validate_duo_login(
     two_factor_token: &str,
     client_id: &str,
     device_identifier: &DeviceId,
-    conn: &mut DbConn,
+    conn: &DbConn,
 ) -> EmptyResult {
     // Result supplied to us by clients in the form "<authz code>|<state>"
     let split: Vec<&str> = two_factor_token.split('|').collect();
@@ -478,7 +478,7 @@ pub async fn validate_duo_login(
         Err(e) => return Err(e),
     };
 
-    let d: Digest = digest(&SHA512_256, format!("{}{}", ctx.nonce, device_identifier).as_bytes());
+    let d: Digest = digest(&SHA512_256, format!("{}{device_identifier}", ctx.nonce).as_bytes());
     let hash: String = HEXLOWER.encode(d.as_ref());
 
     match client.exchange_authz_code_for_result(code, email, hash.as_str()).await {
