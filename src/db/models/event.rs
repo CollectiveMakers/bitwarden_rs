@@ -3,39 +3,40 @@ use chrono::{NaiveDateTime, TimeDelta, Utc};
 use serde_json::Value;
 
 use super::{CipherId, CollectionId, GroupId, MembershipId, OrgPolicyId, OrganizationId, UserId};
+use crate::db::schema::{event, users_organizations};
 use crate::{api::EmptyResult, db::DbConn, error::MapResult, CONFIG};
+use diesel::prelude::*;
 
 // https://bitwarden.com/help/event-logs/
 
-db_object! {
-    // Upstream: https://github.com/bitwarden/server/blob/8a22c0479e987e756ce7412c48a732f9002f0a2d/src/Core/Services/Implementations/EventService.cs
-    // Upstream: https://github.com/bitwarden/server/blob/8a22c0479e987e756ce7412c48a732f9002f0a2d/src/Api/Models/Public/Response/EventResponseModel.cs
-    // Upstream SQL: https://github.com/bitwarden/server/blob/8a22c0479e987e756ce7412c48a732f9002f0a2d/src/Sql/dbo/Tables/Event.sql
-    #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
-    #[diesel(table_name = event)]
-    #[diesel(primary_key(uuid))]
-    pub struct Event {
-        pub uuid: EventId,
-        pub event_type: i32, // EventType
-        pub user_uuid: Option<UserId>,
-        pub org_uuid: Option<OrganizationId>,
-        pub cipher_uuid: Option<CipherId>,
-        pub collection_uuid: Option<CollectionId>,
-        pub group_uuid: Option<GroupId>,
-        pub org_user_uuid: Option<MembershipId>,
-        pub act_user_uuid: Option<UserId>,
-        // Upstream enum: https://github.com/bitwarden/server/blob/8a22c0479e987e756ce7412c48a732f9002f0a2d/src/Core/Enums/DeviceType.cs
-        pub device_type: Option<i32>,
-        pub ip_address: Option<String>,
-        pub event_date: NaiveDateTime,
-        pub policy_uuid: Option<OrgPolicyId>,
-        pub provider_uuid: Option<String>,
-        pub provider_user_uuid: Option<String>,
-        pub provider_org_uuid: Option<String>,
-    }
+// Upstream: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/AdminConsole/Services/Implementations/EventService.cs
+// Upstream: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Public/Models/Response/EventResponseModel.cs
+// Upstream SQL: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Sql/dbo/Tables/Event.sql
+#[derive(Identifiable, Queryable, Insertable, AsChangeset)]
+#[diesel(table_name = event)]
+#[diesel(treat_none_as_null = true)]
+#[diesel(primary_key(uuid))]
+pub struct Event {
+    pub uuid: EventId,
+    pub event_type: i32, // EventType
+    pub user_uuid: Option<UserId>,
+    pub org_uuid: Option<OrganizationId>,
+    pub cipher_uuid: Option<CipherId>,
+    pub collection_uuid: Option<CollectionId>,
+    pub group_uuid: Option<GroupId>,
+    pub org_user_uuid: Option<MembershipId>,
+    pub act_user_uuid: Option<UserId>,
+    // Upstream enum: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/Enums/DeviceType.cs
+    pub device_type: Option<i32>,
+    pub ip_address: Option<String>,
+    pub event_date: NaiveDateTime,
+    pub policy_uuid: Option<OrgPolicyId>,
+    pub provider_uuid: Option<String>,
+    pub provider_user_uuid: Option<String>,
+    pub provider_org_uuid: Option<String>,
 }
 
-// Upstream enum: https://github.com/bitwarden/server/blob/8a22c0479e987e756ce7412c48a732f9002f0a2d/src/Core/Enums/EventType.cs
+// Upstream enum: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/AdminConsole/Enums/EventType.cs
 #[derive(Debug, Copy, Clone)]
 pub enum EventType {
     // User
@@ -71,7 +72,6 @@ pub enum EventType {
     CipherSoftDeleted = 1115,
     CipherRestored = 1116,
     CipherClientToggledCardNumberVisible = 1117,
-    CipherClientToggledTOTPSeedVisible = 1118,
 
     // Collection
     CollectionCreated = 1300,
@@ -87,9 +87,9 @@ pub enum EventType {
     OrganizationUserInvited = 1500,
     OrganizationUserConfirmed = 1501,
     OrganizationUserUpdated = 1502,
-    OrganizationUserRemoved = 1503,
+    OrganizationUserRemoved = 1503, // Organization user data was deleted
     OrganizationUserUpdatedGroups = 1504,
-    // OrganizationUserUnlinkedSso = 1505, // Not supported
+    OrganizationUserUnlinkedSso = 1505,
     OrganizationUserResetPasswordEnroll = 1506,
     OrganizationUserResetPasswordWithdraw = 1507,
     OrganizationUserAdminResetPassword = 1508,
@@ -99,8 +99,8 @@ pub enum EventType {
     OrganizationUserRestored = 1512,
     OrganizationUserApprovedAuthRequest = 1513,
     OrganizationUserRejectedAuthRequest = 1514,
-    OrganizationUserDeleted = 1515,
-    OrganizationUserLeft = 1516,
+    OrganizationUserDeleted = 1515, // Both user and organization user data were deleted
+    OrganizationUserLeft = 1516,    // User voluntarily left the organization
 
     // Organization
     OrganizationUpdated = 1600,
@@ -187,33 +187,33 @@ impl Event {
 }
 
 /// Database methods
-/// https://github.com/bitwarden/server/blob/8a22c0479e987e756ce7412c48a732f9002f0a2d/src/Core/Services/Implementations/EventService.cs
+/// https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/AdminConsole/Services/Implementations/EventService.cs
 impl Event {
     pub const PAGE_SIZE: i64 = 30;
 
     /// #############
     /// Basic Queries
-    pub async fn save(&self, conn: &mut DbConn) -> EmptyResult {
+    pub async fn save(&self, conn: &DbConn) -> EmptyResult {
         db_run! { conn:
             sqlite, mysql {
                 diesel::replace_into(event::table)
-                .values(EventDb::to_db(self))
+                .values(self)
                 .execute(conn)
                 .map_res("Error saving event")
             }
             postgresql {
                 diesel::insert_into(event::table)
-                .values(EventDb::to_db(self))
+                .values(self)
                 .on_conflict(event::uuid)
                 .do_update()
-                .set(EventDb::to_db(self))
+                .set(self)
                 .execute(conn)
                 .map_res("Error saving event")
             }
         }
     }
 
-    pub async fn save_user_event(events: Vec<Event>, conn: &mut DbConn) -> EmptyResult {
+    pub async fn save_user_event(events: Vec<Event>, conn: &DbConn) -> EmptyResult {
         // Special save function which is able to handle multiple events.
         // SQLite doesn't support the DEFAULT argument, and does not support inserting multiple values at the same time.
         // MySQL and PostgreSQL do.
@@ -224,14 +224,13 @@ impl Event {
             sqlite {
                 for event in events {
                     diesel::insert_or_ignore_into(event::table)
-                    .values(EventDb::to_db(&event))
+                    .values(&event)
                     .execute(conn)
                     .unwrap_or_default();
                 }
                 Ok(())
             }
             mysql {
-                let events: Vec<EventDb> = events.iter().map(EventDb::to_db).collect();
                 diesel::insert_or_ignore_into(event::table)
                 .values(&events)
                 .execute(conn)
@@ -239,7 +238,6 @@ impl Event {
                 Ok(())
             }
             postgresql {
-                let events: Vec<EventDb> = events.iter().map(EventDb::to_db).collect();
                 diesel::insert_into(event::table)
                 .values(&events)
                 .on_conflict_do_nothing()
@@ -250,7 +248,7 @@ impl Event {
         }
     }
 
-    pub async fn delete(self, conn: &mut DbConn) -> EmptyResult {
+    pub async fn delete(self, conn: &DbConn) -> EmptyResult {
         db_run! { conn: {
             diesel::delete(event::table.filter(event::uuid.eq(self.uuid)))
                 .execute(conn)
@@ -264,7 +262,7 @@ impl Event {
         org_uuid: &OrganizationId,
         start: &NaiveDateTime,
         end: &NaiveDateTime,
-        conn: &mut DbConn,
+        conn: &DbConn,
     ) -> Vec<Self> {
         db_run! { conn: {
             event::table
@@ -272,13 +270,12 @@ impl Event {
                 .filter(event::event_date.between(start, end))
                 .order_by(event::event_date.desc())
                 .limit(Self::PAGE_SIZE)
-                .load::<EventDb>(conn)
+                .load::<Self>(conn)
                 .expect("Error filtering events")
-                .from_db()
         }}
     }
 
-    pub async fn count_by_org(org_uuid: &OrganizationId, conn: &mut DbConn) -> i64 {
+    pub async fn count_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> i64 {
         db_run! { conn: {
             event::table
                 .filter(event::org_uuid.eq(org_uuid))
@@ -294,7 +291,7 @@ impl Event {
         member_uuid: &MembershipId,
         start: &NaiveDateTime,
         end: &NaiveDateTime,
-        conn: &mut DbConn,
+        conn: &DbConn,
     ) -> Vec<Self> {
         db_run! { conn: {
             event::table
@@ -305,9 +302,8 @@ impl Event {
                 .select(event::all_columns)
                 .order_by(event::event_date.desc())
                 .limit(Self::PAGE_SIZE)
-                .load::<EventDb>(conn)
+                .load::<Self>(conn)
                 .expect("Error filtering events")
-                .from_db()
         }}
     }
 
@@ -315,7 +311,7 @@ impl Event {
         cipher_uuid: &CipherId,
         start: &NaiveDateTime,
         end: &NaiveDateTime,
-        conn: &mut DbConn,
+        conn: &DbConn,
     ) -> Vec<Self> {
         db_run! { conn: {
             event::table
@@ -323,13 +319,12 @@ impl Event {
                 .filter(event::event_date.between(start, end))
                 .order_by(event::event_date.desc())
                 .limit(Self::PAGE_SIZE)
-                .load::<EventDb>(conn)
+                .load::<Self>(conn)
                 .expect("Error filtering events")
-                .from_db()
         }}
     }
 
-    pub async fn clean_events(conn: &mut DbConn) -> EmptyResult {
+    pub async fn clean_events(conn: &DbConn) -> EmptyResult {
         if let Some(days_to_retain) = CONFIG.events_days_retain() {
             let dt = Utc::now().naive_utc() - TimeDelta::try_days(days_to_retain).unwrap();
             db_run! { conn: {

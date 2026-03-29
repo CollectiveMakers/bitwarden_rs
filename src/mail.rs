@@ -85,7 +85,7 @@ fn smtp_transport() -> AsyncSmtpTransport<Tokio1Executor> {
                 smtp_client.authentication(selected_mechanisms)
             } else {
                 // Only show a warning, and return without setting an actual authentication mechanism
-                warn!("No valid SMTP Auth mechanism found for '{}', using default values", mechanism);
+                warn!("No valid SMTP Auth mechanism found for '{mechanism}', using default values");
                 smtp_client
             }
         }
@@ -184,7 +184,7 @@ pub async fn send_delete_account(address: &str, user_id: &UserId) -> EmptyResult
 }
 
 pub async fn send_verify_email(address: &str, user_id: &UserId) -> EmptyResult {
-    let claims = generate_verify_email_claims(user_id.clone());
+    let claims = generate_verify_email_claims(user_id);
     let verify_email_token = encode_jwt(&claims);
 
     let (subject, body_html, body_text) = get_text(
@@ -201,6 +201,27 @@ pub async fn send_verify_email(address: &str, user_id: &UserId) -> EmptyResult {
     send_email(address, &subject, body_html, body_text).await
 }
 
+pub async fn send_register_verify_email(email: &str, token: &str) -> EmptyResult {
+    let mut query = url::Url::parse("https://query.builder").unwrap();
+    query.query_pairs_mut().append_pair("email", email).append_pair("token", token);
+    let query_string = match query.query() {
+        None => err!("Failed to build verify URL query parameters"),
+        Some(query) => query,
+    };
+
+    let (subject, body_html, body_text) = get_text(
+        "email/register_verify_email",
+        json!({
+            // `url.Url` would place the anchor `#` after the query parameters
+            "url": format!("{}/#/finish-signup/?{query_string}", CONFIG.domain()),
+            "img_src": CONFIG._smtp_img_src(),
+            "email": email,
+        }),
+    )?;
+
+    send_email(email, &subject, body_html, body_text).await
+}
+
 pub async fn send_welcome(address: &str) -> EmptyResult {
     let (subject, body_html, body_text) = get_text(
         "email/welcome",
@@ -214,7 +235,7 @@ pub async fn send_welcome(address: &str) -> EmptyResult {
 }
 
 pub async fn send_welcome_must_verify(address: &str, user_id: &UserId) -> EmptyResult {
-    let claims = generate_verify_email_claims(user_id.clone());
+    let claims = generate_verify_email_claims(user_id);
     let verify_email_token = encode_jwt(&claims);
 
     let (subject, body_html, body_text) = get_text(
@@ -280,6 +301,10 @@ pub async fn send_invite(
             .append_pair("organizationId", &org_id)
             .append_pair("organizationUserId", &member_id)
             .append_pair("token", &invite_token);
+
+        if CONFIG.sso_enabled() && CONFIG.sso_only() {
+            query_params.append_pair("orgSsoIdentifier", &org_id);
+        }
         if user.private_key.is_some() {
             query_params.append_pair("orgUserHasExistingUser", "true");
         }
@@ -293,7 +318,7 @@ pub async fn send_invite(
         "email/send_org_invite",
         json!({
             // `url.Url` would place the anchor `#` after the query parameters
-            "url": format!("{}/#/accept-organization/?{}", CONFIG.domain(), query_string),
+            "url": format!("{}/#/accept-organization/?{query_string}", CONFIG.domain()),
             "img_src": CONFIG._smtp_img_src(),
             "org_name": org_name,
         }),
@@ -549,6 +574,46 @@ pub async fn send_change_email(address: &str, token: &str) -> EmptyResult {
     send_email(address, &subject, body_html, body_text).await
 }
 
+pub async fn send_change_email_existing(address: &str, acting_address: &str) -> EmptyResult {
+    let (subject, body_html, body_text) = get_text(
+        "email/change_email_existing",
+        json!({
+            "url": CONFIG.domain(),
+            "img_src": CONFIG._smtp_img_src(),
+            "existing_address": address,
+            "acting_address": acting_address,
+        }),
+    )?;
+
+    send_email(address, &subject, body_html, body_text).await
+}
+
+pub async fn send_change_email_invited(address: &str, acting_address: &str) -> EmptyResult {
+    let (subject, body_html, body_text) = get_text(
+        "email/change_email_invited",
+        json!({
+            "url": CONFIG.domain(),
+            "img_src": CONFIG._smtp_img_src(),
+            "existing_address": address,
+            "acting_address": acting_address,
+        }),
+    )?;
+
+    send_email(address, &subject, body_html, body_text).await
+}
+
+pub async fn send_sso_change_email(address: &str) -> EmptyResult {
+    let (subject, body_html, body_text) = get_text(
+        "email/sso_change_email",
+        json!({
+            "url": format!("{}/#/settings/account", CONFIG.domain()),
+            "img_src": CONFIG._smtp_img_src(),
+        }),
+    )?;
+
+    send_email(address, &subject, body_html, body_text).await
+}
+
 pub async fn send_test(address: &str) -> EmptyResult {
     let (subject, body_html, body_text) = get_text(
         "email/smtp_test",
@@ -594,13 +659,13 @@ async fn send_with_selected_transport(email: Message) -> EmptyResult {
             // Match some common errors and make them more user friendly
             Err(e) => {
                 if e.is_client() {
-                    debug!("Sendmail client error: {:?}", e);
+                    debug!("Sendmail client error: {e:?}");
                     err!(format!("Sendmail client error: {e}"));
                 } else if e.is_response() {
-                    debug!("Sendmail response error: {:?}", e);
+                    debug!("Sendmail response error: {e:?}");
                     err!(format!("Sendmail response error: {e}"));
                 } else {
-                    debug!("Sendmail error: {:?}", e);
+                    debug!("Sendmail error: {e:?}");
                     err!(format!("Sendmail error: {e}"));
                 }
             }
@@ -611,13 +676,13 @@ async fn send_with_selected_transport(email: Message) -> EmptyResult {
             // Match some common errors and make them more user friendly
             Err(e) => {
                 if e.is_client() {
-                    debug!("SMTP client error: {:#?}", e);
+                    debug!("SMTP client error: {e:#?}");
                     err!(format!("SMTP client error: {e}"));
                 } else if e.is_transient() {
-                    debug!("SMTP 4xx error: {:#?}", e);
+                    debug!("SMTP 4xx error: {e:#?}");
                     err!(format!("SMTP 4xx error: {e}"));
                 } else if e.is_permanent() {
-                    debug!("SMTP 5xx error: {:#?}", e);
+                    debug!("SMTP 5xx error: {e:#?}");
                     let mut msg = e.to_string();
                     // Add a special check for 535 to add a more descriptive message
                     if msg.contains("(535)") {
@@ -625,13 +690,13 @@ async fn send_with_selected_transport(email: Message) -> EmptyResult {
                     }
                     err!(format!("SMTP 5xx error: {msg}"));
                 } else if e.is_timeout() {
-                    debug!("SMTP timeout error: {:#?}", e);
+                    debug!("SMTP timeout error: {e:#?}");
                     err!(format!("SMTP timeout error: {e}"));
                 } else if e.is_tls() {
-                    debug!("SMTP encryption error: {:#?}", e);
+                    debug!("SMTP encryption error: {e:#?}");
                     err!(format!("SMTP encryption error: {e}"));
                 } else {
-                    debug!("SMTP error: {:#?}", e);
+                    debug!("SMTP error: {e:#?}");
                     err!(format!("SMTP error: {e}"));
                 }
             }
@@ -640,7 +705,7 @@ async fn send_with_selected_transport(email: Message) -> EmptyResult {
 }
 
 async fn send_email(address: &str, subject: &str, body_html: String, body_text: String) -> EmptyResult {
-    let smtp_from = &CONFIG.smtp_from();
+    let smtp_from = Address::from_str(&CONFIG.smtp_from())?;
 
     let body = if CONFIG.smtp_embed_images() {
         let logo_gray_body = Body::new(crate::api::static_files("logo-gray.png").unwrap().1.to_vec());
@@ -662,9 +727,9 @@ async fn send_email(address: &str, subject: &str, body_html: String, body_text: 
     };
 
     let email = Message::builder()
-        .message_id(Some(format!("<{}@{}>", crate::util::get_uuid(), smtp_from.split('@').collect::<Vec<&str>>()[1])))
+        .message_id(Some(format!("<{}@{}>", crate::util::get_uuid(), smtp_from.domain())))
         .to(Mailbox::new(None, Address::from_str(address)?))
-        .from(Mailbox::new(Some(CONFIG.smtp_from_name()), Address::from_str(smtp_from)?))
+        .from(Mailbox::new(Some(CONFIG.smtp_from_name()), smtp_from))
         .subject(subject)
         .multipart(body)?;
 

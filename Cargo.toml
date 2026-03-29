@@ -1,21 +1,32 @@
-workspace = { members = ["macros"] }
+[workspace.package]
+edition = "2021"
+rust-version = "1.91.0"
+license = "AGPL-3.0-only"
+repository = "https://github.com/dani-garcia/vaultwarden"
+publish = false
+
+[workspace]
+members = ["macros"]
 
 [package]
 name = "vaultwarden"
 version = "1.0.0"
 authors = ["Daniel García <dani-garcia@users.noreply.github.com>"]
-edition = "2021"
-rust-version = "1.83.0"
-resolver = "2"
-
-repository = "https://github.com/dani-garcia/vaultwarden"
 readme = "README.md"
-license = "AGPL-3.0-only"
-publish = false
 build = "build.rs"
+resolver = "2"
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [features]
-# default = ["sqlite"]
+default = [
+    # "sqlite",
+    # "mysql",
+    # "postgresql",
+]
 # Empty to keep compatibility, prefer to set USE_SYSLOG=true
 enable_syslog = []
 mysql = ["diesel/mysql", "diesel_migrations/mysql"]
@@ -26,11 +37,11 @@ vendored_openssl = ["openssl/vendored"]
 # Enable MiMalloc memory allocator to replace the default malloc
 # This can improve performance for Alpine builds
 enable_mimalloc = ["dep:mimalloc"]
-# This is a development dependency, and should only be used during development!
-# It enables the usage of the diesel_logger crate, which is able to output the generated queries.
-# You also need to set an env variable `QUERY_LOGGER=1` to fully activate this so you do not have to re-compile
-# if you want to turn off the logging for a specific run.
-query_logger = ["dep:diesel_logger"]
+s3 = ["opendal/services-s3", "dep:aws-config", "dep:aws-credential-types", "dep:aws-smithy-runtime-api", "dep:anyhow", "dep:http", "dep:reqsign"]
+
+# OIDC specific features
+oidc-accept-rfc3339-timestamps = ["openidconnect/accept-rfc3339-timestamps"]
+oidc-accept-string-booleans = ["openidconnect/accept-string-booleans"]
 
 # Enable unstable features, requires nightly
 # Currently only used to enable rusts official ip support
@@ -44,163 +55,169 @@ syslog = "7.0.0"
 macros = { path = "./macros" }
 
 # Logging
-log = "0.4.25"
+log = "0.4.29"
 fern = { version = "0.7.1", features = ["syslog-7", "reopen-1"] }
-tracing = { version = "0.1.41", features = ["log"] } # Needed to have lettre and webauthn-rs trace logging to work
+tracing = { version = "0.1.44", features = ["log"] } # Needed to have lettre and webauthn-rs trace logging to work
 
 # A `dotenv` implementation for Rust
 dotenvy = { version = "0.15.7", default-features = false }
 
-# Lazy initialization
-once_cell = "1.20.2"
-
 # Numerical libraries
 num-traits = "0.2.19"
 num-derive = "0.4.2"
-bigdecimal = "0.4.7"
+bigdecimal = "0.4.10"
 
 # Web framework
 rocket = { version = "0.5.1", features = ["tls", "json"], default-features = false }
 rocket_ws = { version ="0.1.1" }
 
 # WebSockets libraries
-rmpv = "1.3.0" # MessagePack library
+rmpv = "1.3.1" # MessagePack library
 
 # Concurrent HashMap used for WebSocket messaging and favicons
 dashmap = "6.1.0"
 
 # Async futures
-futures = "0.3.31"
-tokio = { version = "1.43.0", features = ["rt-multi-thread", "fs", "io-util", "parking_lot", "time", "signal", "net"] }
+futures = "0.3.32"
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "fs", "io-util", "parking_lot", "time", "signal", "net"] }
+tokio-util = { version = "0.7.18", features = ["compat"]}
 
 # A generic serialization/deserialization framework
-serde = { version = "1.0.217", features = ["derive"] }
-serde_json = "1.0.138"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 
 # A safe, extensible ORM and Query builder
-diesel = { version = "2.2.7", features = ["chrono", "r2d2", "numeric"] }
-diesel_migrations = "2.2.0"
-diesel_logger = { version = "0.4.0", optional = true }
+# Currently pinned diesel to v2.3.3 as newer version break MySQL/MariaDB compatibility
+diesel = { version = "2.3.6", features = ["chrono", "r2d2", "numeric"] }
+diesel_migrations = "2.3.1"
 
-derive_more = { version = "1.0.0", features = ["from", "into", "as_ref", "deref", "display"] }
+derive_more = { version = "2.1.1", features = ["from", "into", "as_ref", "deref", "display"] }
 diesel-derive-newtype = "2.1.2"
 
 # Bundled/Static SQLite
-libsqlite3-sys = { version = "0.31.0", features = ["bundled"], optional = true }
+libsqlite3-sys = { version = "0.35.0", features = ["bundled"], optional = true }
 
 # Crypto-related libraries
-rand = "0.9.0"
-ring = "0.17.8"
+rand = "0.10.0"
+ring = "0.17.14"
+subtle = "2.6.1"
 
 # UUID generation
-uuid = { version = "1.12.1", features = ["v4"] }
+uuid = { version = "1.21.0", features = ["v4"] }
 
 # Date and time libraries
-chrono = { version = "0.4.39", features = ["clock", "serde"], default-features = false }
-chrono-tz = "0.10.1"
-time = "0.3.37"
+chrono = { version = "0.4.43", features = ["clock", "serde"], default-features = false }
+chrono-tz = "0.10.4"
+time = "0.3.47"
 
 # Job scheduler
-job_scheduler_ng = "2.0.5"
+job_scheduler_ng = "2.4.0"
 
 # Data encoding library Hex/Base32/Base64
-data-encoding = "2.7.0"
+data-encoding = "2.10.0"
 
 # JWT library
-jsonwebtoken = "9.3.0"
+jsonwebtoken = { version = "10.3.0", features = ["use_pem", "rust_crypto"], default-features = false }
 
 # TOTP library
 totp-lite = "2.0.1"
 
 # Yubico Library
-yubico = { version = "0.12.0", features = ["online-tokio"], default-features = false }
+yubico = { package = "yubico_ng", version = "0.14.1", features = ["online-tokio"], default-features = false }
 
 # WebAuthn libraries
-webauthn-rs = "0.3.2"
+# danger-allow-state-serialisation is needed to save the state in the db
+# danger-credential-internals is needed to support U2F to Webauthn migration
+webauthn-rs = { version = "0.5.4", features = ["danger-allow-state-serialisation", "danger-credential-internals"] }
+webauthn-rs-proto = "0.5.4"
+webauthn-rs-core = "0.5.4"
 
 # Handling of URL's for WebAuthn and favicons
-url = "2.5.4"
+url = "2.5.8"
 
 # Email libraries
-lettre = { version = "0.11.11", features = ["smtp-transport", "sendmail-transport", "builder", "serde", "tokio1-native-tls", "hostname", "tracing", "tokio1"], default-features = false }
-percent-encoding = "2.3.1" # URL encoding library used for URL's in the emails
+lettre = { version = "0.11.19", features = ["smtp-transport", "sendmail-transport", "builder", "serde", "hostname", "tracing", "tokio1-rustls", "ring", "rustls-native-certs"], default-features = false }
+percent-encoding = "2.3.2" # URL encoding library used for URL's in the emails
 email_address = "0.2.9"
 
 # HTML Template library
-handlebars = { version = "6.3.0", features = ["dir_source"] }
+handlebars = { version = "6.4.0", features = ["dir_source"] }
 
 # HTTP client (Used for favicons, version check, DUO and HIBP API)
-reqwest = { version = "0.12.12", features = ["native-tls-alpn", "stream", "json", "gzip", "brotli", "socks", "cookies"] }
-hickory-resolver = "0.24.2"
+reqwest = { version = "0.12.28", features = ["rustls-tls", "rustls-tls-native-roots", "stream", "json", "deflate", "gzip", "brotli", "zstd", "socks", "cookies", "charset", "http2", "system-proxy"], default-features = false}
+hickory-resolver = "0.25.2"
 
 # Favicon extraction libraries
-html5gum = "0.7.0"
-regex = { version = "1.11.1", features = ["std", "perf", "unicode-perl"], default-features = false }
-data-url = "0.3.1"
-bytes = "1.9.0"
+html5gum = "0.8.3"
+regex = { version = "1.12.3", features = ["std", "perf", "unicode-perl"], default-features = false }
+data-url = "0.3.2"
+bytes = "1.11.1"
+svg-hush = "0.9.6"
 
 # Cache function results (Used for version check and favicon fetching)
-cached = { version = "0.54.0", features = ["async"] }
+cached = { version = "0.56.0", features = ["async"] }
 
 # Used for custom short lived cookie jar during favicon extraction
 cookie = "0.18.1"
-cookie_store = "0.21.1"
+cookie_store = "0.22.1"
 
 # Used by U2F, JWT and PostgreSQL
-openssl = "0.10.69"
+openssl = "0.10.75"
 
 # CLI argument parsing
 pico-args = "0.5.0"
 
 # Macro ident concatenation
-paste = "1.0.15"
-governor = "0.8.0"
+pastey = "0.2.1"
+governor = "0.10.4"
+
+# OIDC for SSO
+openidconnect = { version = "4.0.1", features = ["reqwest", "rustls-tls"] }
+mini-moka = "0.10.3"
 
 # Check client versions for specific features.
-semver = "1.0.25"
+semver = "1.0.27"
 
 # Allow overriding the default memory allocator
 # Mainly used for the musl builds, since the default musl malloc is very slow
-mimalloc = { version = "0.1.43", features = ["secure"], default-features = false, optional = true }
-which = "7.0.1"
+mimalloc = { version = "0.1.48", features = ["secure"], default-features = false, optional = true }
+
+which = "8.0.0"
 
 # Argon2 library with support for the PHC format
 argon2 = "0.5.3"
 
 # Reading a password from the cli for generating the Argon2id ADMIN_TOKEN
-rpassword = "7.3.1"
+rpassword = "7.4.0"
 
 # Loading a dynamic CSS Stylesheet
 grass_compiler = { version = "0.13.4", default-features = false }
 
-[patch.crates-io]
-# Patch yubico to remove duplicate crates of older versions
-yubico = { git = "https://github.com/BlackDex/yubico-rs", rev = "00df14811f58155c0f02e3ab10f1570ed3e115c6" }
+# File are accessed through Apache OpenDAL
+opendal = { version = "0.55.0", features = ["services-fs"], default-features = false }
+
+# For retrieving AWS credentials, including temporary SSO credentials
+anyhow = { version = "1.0.101", optional = true }
+aws-config = { version = "1.8.14", features = ["behavior-version-latest", "rt-tokio", "credentials-process", "sso"], default-features = false, optional = true }
+aws-credential-types = { version = "1.2.13", optional = true }
+aws-smithy-runtime-api = { version = "1.11.5", optional = true }
+http = { version = "1.4.0", optional = true }
+reqsign = { version = "0.16.5", optional = true }
 
 # Strip debuginfo from the release builds
-# The symbols are the provide better panic traces
+# The debug symbols are to provide better panic traces
 # Also enable fat LTO and use 1 codegen unit for optimizations
 [profile.release]
 strip = "debuginfo"
 lto = "fat"
 codegen-units = 1
-
-# A little bit of a speedup
-[profile.dev]
-split-debuginfo = "unpacked"
-
-# Always build argon2 using opt-level 3
-# This is a huge speed improvement during testing
-[profile.dev.package.argon2]
-opt-level = 3
+debug = false
 
 # Optimize for size
 [profile.release-micro]
 inherits = "release"
-opt-level = "z"
 strip = "symbols"
-lto = "fat"
-codegen-units = 1
+opt-level = "z"
 panic = "abort"
 
 # Profile for systems with low resources
@@ -211,24 +228,51 @@ strip = "symbols"
 lto = "thin"
 codegen-units = 16
 
+# Used for profiling and debugging like valgrind or heaptrack
+# Inherits release to be sure all optimizations have been done
+[profile.dbg]
+inherits = "release"
+strip = "none"
+split-debuginfo = "off"
+debug = "full"
+
+# A little bit of a speedup for generic building
+[profile.dev]
+split-debuginfo = "unpacked"
+debug = "line-tables-only"
+
+# Used for CI builds to improve compile time
+[profile.ci]
+inherits = "dev"
+debug = false
+debug-assertions = false
+strip = "symbols"
+panic = "abort"
+
+# Always build argon2 using opt-level 3
+# This is a huge speed improvement during testing
+[profile.dev.package.argon2]
+opt-level = 3
+
 # Linting config
 # https://doc.rust-lang.org/rustc/lints/groups.html
-[lints.rust]
+[workspace.lints.rust]
 # Forbid
 unsafe_code = "forbid"
 non_ascii_idents = "forbid"
 
 # Deny
 deprecated_in_future = "deny"
+deprecated_safe = { level = "deny", priority = -1 }
 future_incompatible = { level = "deny", priority = -1 }
 keyword_idents = { level = "deny", priority = -1 }
 let_underscore = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
 noop_method_call = "deny"
 refining_impl_trait = { level = "deny", priority = -1 }
 rust_2018_idioms = { level = "deny", priority = -1 }
 rust_2021_compatibility = { level = "deny", priority = -1 }
 rust_2024_compatibility = { level = "deny", priority = -1 }
-edition_2024_expr_fragment_specifier = "allow" # Once changed to Rust 2024 this should be removed and macro's should be validated again
 single_use_lifetimes = "deny"
 trivial_casts = "deny"
 trivial_numeric_casts = "deny"
@@ -238,23 +282,30 @@ unused_lifetimes = "deny"
 unused_qualifications = "deny"
 variant_size_differences = "deny"
 # Allow the following lints since these cause issues with Rust v1.84.0 or newer
-# Building Vaultwarden with Rust v1.85.0 and edition 2024 also works without issues
+# Building Vaultwarden with Rust v1.85.0 with edition 2024 also works without issues
+edition_2024_expr_fragment_specifier = "allow" # Once changed to Rust 2024 this should be removed and macro's should be validated again
 if_let_rescope = "allow"
 tail_expr_drop_order = "allow"
 
 # https://rust-lang.github.io/rust-clippy/stable/index.html
-[lints.clippy]
+[workspace.lints.clippy]
 # Warn
 dbg_macro = "warn"
 todo = "warn"
 
+# Ignore/Allow
+result_large_err = "allow"
+
 # Deny
+branches_sharing_code = "deny"
 case_sensitive_file_extension_comparisons = "deny"
 cast_lossless = "deny"
 clone_on_ref_ptr = "deny"
 equatable_if_let = "deny"
+excessive_precision = "deny"
 filter_map_next = "deny"
 float_cmp_const = "deny"
+implicit_clone = "deny"
 inefficient_to_string = "deny"
 iter_on_empty_collections = "deny"
 iter_on_single_items = "deny"
@@ -263,18 +314,23 @@ macro_use_imports = "deny"
 manual_assert = "deny"
 manual_instant_elapsed = "deny"
 manual_string_new = "deny"
-match_on_vec_items = "deny"
 match_wildcard_for_single_variants = "deny"
 mem_forget = "deny"
+needless_borrow = "deny"
+needless_collect = "deny"
 needless_continue = "deny"
 needless_lifetimes = "deny"
 option_option = "deny"
+redundant_clone = "deny"
 string_add_assign = "deny"
-string_to_string = "deny"
 unnecessary_join = "deny"
 unnecessary_self_imports = "deny"
 unnested_or_patterns = "deny"
 unused_async = "deny"
 unused_self = "deny"
+useless_let_if_seq = "deny"
 verbose_file_reads = "deny"
 zero_sized_map_values = "deny"
+
+[lints]
+workspace = true

@@ -1,3 +1,10 @@
+name: Cleanup
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
@@ -9,10 +16,11 @@ on:
   schedule:
     - cron: '0 1 * * FRI'
 
-name: Cleanup
 jobs:
   releasecache-cleanup:
     name: Releasecache Cleanup
+    permissions:
+      packages: write # To be able to cleanup old caches
     runs-on: ubuntu-24.04
     continue-on-error: true
     timeout-minutes: 30

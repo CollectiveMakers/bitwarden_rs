@@ -32,10 +32,14 @@ pub use crate::api::{
     web::routes as web_routes,
     web::static_files,
 };
-use crate::db::{models::User, DbConn};
+use crate::db::{
+    models::{OrgPolicy, OrgPolicyType, User},
+    DbConn,
+};
+use crate::CONFIG;
 
 // Type aliases for API methods results
-type ApiResult<T> = Result<T, crate::error::Error>;
+pub type ApiResult<T> = Result<T, crate::error::Error>;
 pub type JsonResult = ApiResult<Json<Value>>;
 pub type EmptyResult = ApiResult<()>;
 
@@ -43,6 +47,7 @@ pub type EmptyResult = ApiResult<()>;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PasswordOrOtpData {
+    #[serde(alias = "MasterPasswordHash")]
     master_password_hash: Option<String>,
     otp: Option<String>,
 }
@@ -51,7 +56,7 @@ impl PasswordOrOtpData {
     /// Tokens used via this struct can be used multiple times during the process
     /// First for the validation to continue, after that to enable or validate the following actions
     /// This is different per caller, so it can be adjusted to delete the token or not
-    pub async fn validate(&self, user: &User, delete_if_valid: bool, conn: &mut DbConn) -> EmptyResult {
+    pub async fn validate(&self, user: &User, delete_if_valid: bool, conn: &DbConn) -> EmptyResult {
         use crate::api::core::two_factor::protected_actions::validate_protected_action_otp;
 
         match (self.master_password_hash.as_deref(), self.otp.as_deref()) {
@@ -67,4 +72,52 @@ impl PasswordOrOtpData {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterPasswordPolicy {
+    min_complexity: Option<u8>,
+    min_length: Option<u32>,
+    require_lower: bool,
+    require_upper: bool,
+    require_numbers: bool,
+    require_special: bool,
+    enforce_on_login: bool,
+}
+
+// Fetch all valid Master Password Policies and merge them into one with all trues and largest numbers as one policy
+async fn master_password_policy(user: &User, conn: &DbConn) -> Value {
+    let master_password_policies: Vec<MasterPasswordPolicy> =
+        OrgPolicy::find_accepted_and_confirmed_by_user_and_active_policy(
+            &user.uuid,
+            OrgPolicyType::MasterPassword,
+            conn,
+        )
+        .await
+        .into_iter()
+        .filter_map(|p| serde_json::from_str(&p.data).ok())
+        .collect();
+
+    let mut mpp_json = if !master_password_policies.is_empty() {
+        json!(master_password_policies.into_iter().reduce(|acc, policy| {
+            MasterPasswordPolicy {
+                min_complexity: acc.min_complexity.max(policy.min_complexity),
+                min_length: acc.min_length.max(policy.min_length),
+                require_lower: acc.require_lower || policy.require_lower,
+                require_upper: acc.require_upper || policy.require_upper,
+                require_numbers: acc.require_numbers || policy.require_numbers,
+                require_special: acc.require_special || policy.require_special,
+                enforce_on_login: acc.enforce_on_login || policy.enforce_on_login,
+            }
+        }))
+    } else if CONFIG.sso_enabled() {
+        CONFIG.sso_master_password_policy_value().unwrap_or(json!({}))
+    } else {
+        json!({})
+    };
+
+    // NOTE: Upstream still uses PascalCase here for `Object`!
+    mpp_json["Object"] = json!("masterPasswordPolicy");
+    mpp_json
 }
