@@ -14,3 +14,7 @@ data
 
 # Web vault
 web-vault
+logs
+
+# Claude local config
+.claude
